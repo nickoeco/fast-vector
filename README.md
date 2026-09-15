@@ -13,6 +13,7 @@ in-memory flat index using cosine similarity.
 - Exact scalar dot-product scan
 - Deterministic heap-based Top-K selection
 - Unit tests, command-line demo, and a reproducible single-thread benchmark
+- Cross-language correctness validation against exact NumPy ground truth
 
 HNSW, persistence, deletion, batch operations, explicit SIMD, service APIs, and
 metadata storage are not implemented yet.
@@ -119,11 +120,31 @@ P50/P95/P99 per-query latency and overall QPS. It is a single-process, single-th
 in-memory baseline, not a production service benchmark. No performance numbers are
 pre-recorded here because they depend on the machine, compiler, and build flags.
 
+## NumPy correctness validation
+
+The validation script generates deterministic float32 database and query vectors, writes
+them as inspectable CSV files, computes exact cosine Top-K results with NumPy, runs the C++
+`FlatIndex` on the same inputs, and reports Recall@K plus the maximum score difference.
+NumPy is a validation-only dependency:
+
+```bash
+python3 -m pip install -r scripts/requirements.txt
+python3 scripts/validate_recall.py \
+  --runner build-release/fast_vector_validate \
+  --output-dir validation-output
+```
+
+The generated directory contains the inputs, NumPy ground truth, C++ results, and a JSON
+summary. It is ignored by Git. Exact `FlatIndex` validation requires Recall@K of `1.0` for
+every query, an identical ranked ID sequence, and a maximum absolute score difference no
+greater than `1e-5`. Both sides use descending score and ascending vector ID as the
+deterministic tie-break rule.
+
 ## Roadmap
 
-Planned phases add NumPy correctness checks and persistence, then concurrency and SIMD,
-a from-scratch HNSW index, gRPC, embedding pipelines, and container deployment. The
-exact `FlatIndex` remains the correctness and recall baseline for those implementations.
+Planned phases add persistence, then concurrency and SIMD, a from-scratch HNSW index,
+gRPC, embedding pipelines, and container deployment. The exact `FlatIndex` remains the
+correctness and recall baseline for those implementations.
 
 ## License
 
