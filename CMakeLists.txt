@@ -4,6 +4,7 @@ project(fast-vector VERSION 0.1.0 LANGUAGES CXX)
 
 option(FAST_VECTOR_BUILD_TESTS "Build unit tests" ON)
 option(FAST_VECTOR_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(FAST_VECTOR_BUILD_VALIDATION "Build the cross-language validation runner" ON)
 option(FAST_VECTOR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 add_library(fast_vector
@@ -73,4 +74,11 @@ if(FAST_VECTOR_BUILD_BENCHMARKS)
     target_link_libraries(fast_vector_benchmark PRIVATE fast_vector::fast_vector)
     fast_vector_set_warnings(fast_vector_benchmark)
     fast_vector_enable_sanitizers(fast_vector_benchmark)
+endif()
+
+if(FAST_VECTOR_BUILD_VALIDATION)
+    add_executable(fast_vector_validate tools/validate_recall.cpp)
+    target_link_libraries(fast_vector_validate PRIVATE fast_vector::fast_vector)
+    fast_vector_set_warnings(fast_vector_validate)
+    fast_vector_enable_sanitizers(fast_vector_validate)
 endif()
