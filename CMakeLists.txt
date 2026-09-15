@@ -1,0 +1,76 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(fast-vector VERSION 0.1.0 LANGUAGES CXX)
+
+option(FAST_VECTOR_BUILD_TESTS "Build unit tests" ON)
+option(FAST_VECTOR_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(FAST_VECTOR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+add_library(fast_vector
+    src/distance.cpp
+    src/flat_index.cpp
+)
+add_library(fast_vector::fast_vector ALIAS fast_vector)
+
+target_compile_features(fast_vector PUBLIC cxx_std_20)
+target_include_directories(fast_vector
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+function(fast_vector_set_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endfunction()
+
+function(fast_vector_enable_sanitizers target)
+    if(FAST_VECTOR_ENABLE_SANITIZERS)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
+            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        else()
+            message(FATAL_ERROR "Sanitizers are supported only with GCC or Clang on non-Windows platforms")
+        endif()
+    endif()
+endfunction()
+
+fast_vector_set_warnings(fast_vector)
+fast_vector_enable_sanitizers(fast_vector)
+
+add_executable(fast_vector_demo apps/demo.cpp)
+target_link_libraries(fast_vector_demo PRIVATE fast_vector::fast_vector)
+fast_vector_set_warnings(fast_vector_demo)
+fast_vector_enable_sanitizers(fast_vector_demo)
+
+if(FAST_VECTOR_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
+    )
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+    add_executable(fast_vector_tests
+        tests/test_distance.cpp
+        tests/test_flat_index.cpp
+    )
+    target_link_libraries(fast_vector_tests PRIVATE fast_vector::fast_vector GTest::gtest_main)
+    fast_vector_set_warnings(fast_vector_tests)
+    fast_vector_enable_sanitizers(fast_vector_tests)
+
+    include(GoogleTest)
+    gtest_discover_tests(fast_vector_tests)
+endif()
+
+if(FAST_VECTOR_BUILD_BENCHMARKS)
+    add_executable(fast_vector_benchmark benchmarks/benchmark_flat_index.cpp)
+    target_link_libraries(fast_vector_benchmark PRIVATE fast_vector::fast_vector)
+    fast_vector_set_warnings(fast_vector_benchmark)
+    fast_vector_enable_sanitizers(fast_vector_benchmark)
+endif()

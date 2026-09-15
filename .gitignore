@@ -1,0 +1,11 @@
+/build/
+/build-*/
+/.cache/
+/compile_commands.json
+/.vscode/
+/.idea/
+*.swp
+*.swo
+__pycache__/
+*.py[cod]
+.venv/
