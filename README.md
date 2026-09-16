@@ -116,11 +116,25 @@ cmake --build build-release --parallel
 ./build-release/fast_vector_benchmark
 ```
 
-The benchmark uses a fixed seed, 10,000 vectors, 128 dimensions, 1,000 queries, Top-10,
-and a warm-up period. It reports index construction time separately from average,
-P50/P95/P99 per-query latency and overall QPS. It is a single-process, single-thread,
-in-memory baseline, not a production service benchmark. No performance numbers are
-pre-recorded here because they depend on the machine, compiler, and build flags.
+The default run uses a fixed seed, 10,000 vectors, 128 dimensions, 1,000 queries, Top-10,
+and a warm-up period. Parameters can be changed without editing source code:
+
+```bash
+./build-release/fast_vector_benchmark \
+  --vectors 50000 \
+  --dimension 256 \
+  --queries 500 \
+  --k 20 \
+  --warmup 20 \
+  --seed 20250908
+```
+
+The output separates index construction, snapshot save, snapshot load, average and
+P50/P95/P99 query latency, and overall QPS. It also reports the snapshot file size and,
+on Linux, approximate resident-set-size deltas. RSS deltas include allocator and container
+overhead and are not an exact index-memory measurement. The benchmark is a single-process,
+single-thread baseline, not a production service benchmark. No performance numbers are
+pre-recorded here because they depend on the machine, compiler, storage, and build flags.
 
 ## NumPy correctness validation
 
