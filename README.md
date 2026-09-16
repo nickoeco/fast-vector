@@ -15,6 +15,7 @@ in-memory flat index using cosine similarity.
 - Unit tests, command-line demo, and a reproducible single-thread benchmark
 - Cross-language correctness validation against exact NumPy ground truth
 - Versioned binary save/load for `FlatIndex`, with structural and checksum validation
+- Ordered batch search backed by a reusable fixed-size worker pool
 
 HNSW, deletion, batch operations, explicit SIMD, service APIs, and metadata storage are
 not implemented yet. Persistence currently means complete snapshot save/load; incremental
@@ -104,7 +105,10 @@ all `N` scores.
 `FlatIndex` contains no internal synchronization. Concurrent calls to `search()` are
 safe only while no thread is calling `add()`. Calling `add()` concurrently with any
 other operation, or calling `add()` from multiple threads, is unsupported and requires
-external synchronization.
+external synchronization. `BatchSearcher` owns persistent workers and performs concurrent
+read-only calls while preserving input query order. The referenced index must outlive the
+searcher and remain immutable. Destroying a `BatchSearcher` concurrently with `search()` is
+unsupported.
 
 ## Benchmark
 
@@ -126,15 +130,18 @@ and a warm-up period. Parameters can be changed without editing source code:
   --queries 500 \
   --k 20 \
   --warmup 20 \
+  --threads 4 \
   --seed 20250908
 ```
 
 The output separates index construction, snapshot save, snapshot load, average and
-P50/P95/P99 query latency, and overall QPS. It also reports the snapshot file size and,
-on Linux, approximate resident-set-size deltas. RSS deltas include allocator and container
-overhead and are not an exact index-memory measurement. The benchmark is a single-process,
-single-thread baseline, not a production service benchmark. No performance numbers are
-pre-recorded here because they depend on the machine, compiler, storage, and build flags.
+P50/P95/P99 scalar-query latency, scalar QPS, batch wall time, parallel batch QPS, and
+speedup. It also reports the snapshot file size and, on Linux, approximate
+resident-set-size deltas. RSS deltas include allocator and container overhead and are not
+an exact index-memory measurement. Batch QPS measures an in-process fixed query set and
+does not claim per-request tail latency under concurrent service load. No performance
+numbers are pre-recorded here because they depend on the machine, compiler, storage, and
+build flags.
 
 ## NumPy correctness validation
 

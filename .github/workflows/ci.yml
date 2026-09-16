@@ -41,3 +41,19 @@ jobs:
             --query-count 20 \
             --dimension 32 \
             --k 10
+
+  thread-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DFAST_VECTOR_ENABLE_THREAD_SANITIZER=ON \
+            -DFAST_VECTOR_BUILD_BENCHMARKS=OFF \
+            -DFAST_VECTOR_BUILD_VALIDATION=OFF
+      - name: Build
+        run: cmake --build build-tsan --parallel
+      - name: Test
+        run: ctest --test-dir build-tsan --output-on-failure
