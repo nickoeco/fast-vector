@@ -14,9 +14,11 @@ in-memory flat index using cosine similarity.
 - Deterministic heap-based Top-K selection
 - Unit tests, command-line demo, and a reproducible single-thread benchmark
 - Cross-language correctness validation against exact NumPy ground truth
+- Versioned binary save/load for `FlatIndex`, with structural and checksum validation
 
-HNSW, persistence, deletion, batch operations, explicit SIMD, service APIs, and
-metadata storage are not implemented yet.
+HNSW, deletion, batch operations, explicit SIMD, service APIs, and metadata storage are
+not implemented yet. Persistence currently means complete snapshot save/load; incremental
+persistence is not implemented.
 
 ## Requirements
 
@@ -139,6 +141,40 @@ summary. It is ignored by Git. Exact `FlatIndex` validation requires Recall@K of
 every query, an identical ranked ID sequence, and a maximum absolute score difference no
 greater than `1e-5`. Both sides use descending score and ascending vector ID as the
 deterministic tie-break rule.
+
+## Binary index persistence
+
+`FlatIndex` snapshots preserve normalized float32 vectors and IDs exactly:
+
+```cpp
+#include "fast_vector/flat_index_io.h"
+
+fast_vector::save_flat_index(index, "example.fv");
+fast_vector::FlatIndex restored = fast_vector::load_flat_index("example.fv");
+```
+
+Version 1 uses a fixed little-endian layout:
+
+```text
+8 bytes   magic: "FVINDEX\\0"
+4 bytes   format version
+4 bytes   header size
+4 bytes   endianness marker
+4 bytes   normalized-cosine flags
+8 bytes   dimension
+8 bytes   vector count
+8 bytes   payload size
+8 bytes   FNV-1a payload checksum
+N * 8     vector IDs
+N * d * 4 normalized float32 components
+```
+
+The loader rejects unknown versions or flags, invalid dimensions and sizes, truncated or
+trailing data, checksum mismatches, duplicate IDs, non-finite components, and vectors that
+are not L2-normalized. The checksum detects accidental corruption; FNV-1a is not a
+cryptographic authenticity mechanism. The format does not serialize C++ container objects
+or pointers, and loading rebuilds the duplicate-ID set. Snapshot writes are not crash-atomic
+in version 1, so callers should write to a new path before replacing an important snapshot.
 
 ## Roadmap
 
