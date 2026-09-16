@@ -6,8 +6,16 @@ option(FAST_VECTOR_BUILD_TESTS "Build unit tests" ON)
 option(FAST_VECTOR_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(FAST_VECTOR_BUILD_VALIDATION "Build the cross-language validation runner" ON)
 option(FAST_VECTOR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(FAST_VECTOR_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
+
+if(FAST_VECTOR_ENABLE_SANITIZERS AND FAST_VECTOR_ENABLE_THREAD_SANITIZER)
+    message(FATAL_ERROR "Address/Undefined sanitizers and ThreadSanitizer cannot be combined")
+endif()
+
+find_package(Threads REQUIRED)
 
 add_library(fast_vector
+    src/batch_searcher.cpp
     src/distance.cpp
     src/flat_index.cpp
     src/flat_index_io.cpp
@@ -20,6 +28,7 @@ target_include_directories(fast_vector
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
+target_link_libraries(fast_vector PRIVATE Threads::Threads)
 
 function(fast_vector_set_warnings target)
     if(MSVC)
@@ -36,6 +45,14 @@ function(fast_vector_enable_sanitizers target)
             target_link_options(${target} PRIVATE -fsanitize=address,undefined)
         else()
             message(FATAL_ERROR "Sanitizers are supported only with GCC or Clang on non-Windows platforms")
+        endif()
+    endif()
+    if(FAST_VECTOR_ENABLE_THREAD_SANITIZER)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
+            target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=thread)
+        else()
+            message(FATAL_ERROR "ThreadSanitizer is supported only with GCC or Clang on non-Windows platforms")
         endif()
     endif()
 endfunction()
@@ -60,6 +77,7 @@ if(FAST_VECTOR_BUILD_TESTS)
     enable_testing()
     add_executable(fast_vector_tests
         tests/test_distance.cpp
+        tests/test_batch_searcher.cpp
         tests/test_flat_index.cpp
         tests/test_flat_index_io.cpp
     )
