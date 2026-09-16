@@ -9,6 +9,8 @@
 
 namespace fast_vector {
 
+class FlatIndexSerializer;
+
 /** Exact cosine-similarity index backed by row-major contiguous storage. */
 class FlatIndex final : public VectorIndex {
 public:
@@ -23,6 +25,8 @@ public:
     [[nodiscard]] std::size_t dimension() const noexcept override;
 
 private:
+    friend class FlatIndexSerializer;
+
     std::size_t dimension_;
     std::vector<float> vectors_;
     std::vector<VectorId> ids_;

@@ -10,6 +10,7 @@ option(FAST_VECTOR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehav
 add_library(fast_vector
     src/distance.cpp
     src/flat_index.cpp
+    src/flat_index_io.cpp
 )
 add_library(fast_vector::fast_vector ALIAS fast_vector)
 
@@ -60,6 +61,7 @@ if(FAST_VECTOR_BUILD_TESTS)
     add_executable(fast_vector_tests
         tests/test_distance.cpp
         tests/test_flat_index.cpp
+        tests/test_flat_index_io.cpp
     )
     target_link_libraries(fast_vector_tests PRIVATE fast_vector::fast_vector GTest::gtest_main)
     fast_vector_set_warnings(fast_vector_tests)
