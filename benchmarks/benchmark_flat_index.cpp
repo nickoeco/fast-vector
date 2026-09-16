@@ -12,6 +12,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -24,6 +25,7 @@
 
 #include "fast_vector/flat_index.h"
 #include "fast_vector/flat_index_io.h"
+#include "fast_vector/batch_searcher.h"
 
 namespace {
 
@@ -35,6 +37,7 @@ struct BenchmarkConfig {
     std::size_t query_count = 1'000;
     std::size_t top_k = 10;
     std::size_t warmup_count = 20;
+    std::size_t thread_count = 1;
     std::uint32_t seed = 20250908U;
 };
 
@@ -95,6 +98,8 @@ BenchmarkConfig parse_arguments(const int argc, char* argv[]) {
             config.top_k = parse_positive_size(value, option);
         } else if (option == "--warmup") {
             config.warmup_count = parse_positive_size(value, option);
+        } else if (option == "--threads") {
+            config.thread_count = parse_positive_size(value, option);
         } else if (option == "--seed") {
             const std::uint64_t seed = parse_unsigned(value, option);
             if (seed > std::numeric_limits<std::uint32_t>::max()) {
@@ -151,7 +156,7 @@ std::uint64_t non_negative_difference(
 
 void print_usage() {
     std::cerr << "Usage: fast_vector_benchmark [--vectors N] [--dimension D] "
-                 "[--queries Q] [--k K] [--warmup W] [--seed S]\n";
+                 "[--queries Q] [--k K] [--warmup W] [--threads T] [--seed S]\n";
 }
 
 }  // namespace
@@ -159,12 +164,21 @@ void print_usage() {
 int main(const int argc, char* argv[]) {
     try {
         const BenchmarkConfig config = parse_arguments(argc, argv);
+        if (config.dimension >
+            std::numeric_limits<std::size_t>::max() / config.query_count) {
+            throw std::invalid_argument("query matrix size overflows");
+        }
         std::mt19937 generator(config.seed);
 
         std::vector<std::vector<float>> queries;
         queries.reserve(config.query_count);
         for (std::size_t i = 0; i < config.query_count; ++i) {
             queries.push_back(random_vector(generator, config.dimension));
+        }
+        std::vector<float> flattened_queries;
+        flattened_queries.reserve(config.query_count * config.dimension);
+        for (const auto& query : queries) {
+            flattened_queries.insert(flattened_queries.end(), query.begin(), query.end());
         }
 
         const auto rss_before_build = resident_set_size_bytes();
@@ -208,6 +222,21 @@ int main(const int argc, char* argv[]) {
         }
         const auto search_end = Clock::now();
 
+        fast_vector::BatchSearcher batch_searcher(loaded_index, config.thread_count);
+        const std::size_t batch_warmup_count =
+            std::min(config.warmup_count, config.query_count);
+        const std::span<const float> batch_warmup_queries(
+            flattened_queries.data(), batch_warmup_count * config.dimension);
+        static_cast<void>(batch_searcher.search(
+            batch_warmup_queries, batch_warmup_count, config.top_k));
+        const auto batch_start = Clock::now();
+        const auto batch_results =
+            batch_searcher.search(flattened_queries, config.query_count, config.top_k);
+        const auto batch_end = Clock::now();
+        for (const auto& result : batch_results) {
+            checksum += result.front().score;
+        }
+
         const double build_ms =
             std::chrono::duration<double, std::milli>(build_end - build_start).count();
         const double save_ms =
@@ -216,6 +245,12 @@ int main(const int argc, char* argv[]) {
             std::chrono::duration<double, std::milli>(load_end - load_start).count();
         const double total_search_seconds =
             std::chrono::duration<double>(search_end - search_start).count();
+        const double batch_search_seconds =
+            std::chrono::duration<double>(batch_end - batch_start).count();
+        const double scalar_qps =
+            static_cast<double>(config.query_count) / total_search_seconds;
+        const double batch_qps =
+            static_cast<double>(config.query_count) / batch_search_seconds;
         const double average_us =
             std::accumulate(latencies_us.begin(), latencies_us.end(), 0.0) /
             static_cast<double>(latencies_us.size());
@@ -235,6 +270,7 @@ int main(const int argc, char* argv[]) {
                   << "Query count: " << config.query_count << '\n'
                   << "Top-K: " << config.top_k << '\n'
                   << "Warmup queries: " << config.warmup_count << '\n'
+                  << "Batch threads: " << batch_searcher.thread_count() << '\n'
                   << "Random seed: " << config.seed << '\n'
                   << "Index build time (ms): " << build_ms << '\n'
                   << "Index save time (ms): " << save_ms << '\n'
@@ -248,8 +284,10 @@ int main(const int argc, char* argv[]) {
                   << "P50 query latency (us): " << percentile(latencies_us, 0.50) << '\n'
                   << "P95 query latency (us): " << percentile(latencies_us, 0.95) << '\n'
                   << "P99 query latency (us): " << percentile(latencies_us, 0.99) << '\n'
-                  << "QPS: " << static_cast<double>(config.query_count) / total_search_seconds
-                  << '\n'
+                  << "Scalar QPS: " << scalar_qps << '\n'
+                  << "Batch wall time (ms): " << batch_search_seconds * 1'000.0 << '\n'
+                  << "Batch QPS: " << batch_qps << '\n'
+                  << "Batch speedup vs scalar: " << batch_qps / scalar_qps << '\n'
                   << "Checksum: " << checksum << '\n';
     } catch (const std::exception& error) {
         std::cerr << "Benchmark failed: " << error.what() << '\n';
