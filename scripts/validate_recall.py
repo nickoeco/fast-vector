@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dimension", type=int, default=64)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20250908)
+    parser.add_argument("--kernel", choices=("scalar", "auto", "avx2"), default="scalar")
     return parser.parse_args()
 
 
@@ -133,7 +134,14 @@ def main() -> int:
     write_results(truth_path, query_ids, truth_ids, truth_scores)
 
     subprocess.run(
-        [str(args.runner), str(vectors_path), str(queries_path), str(args.k), str(cpp_path)],
+        [
+            str(args.runner),
+            str(vectors_path),
+            str(queries_path),
+            str(args.k),
+            str(cpp_path),
+            args.kernel,
+        ],
         check=True,
     )
     cpp_ids, cpp_scores = read_cpp_results(cpp_path, query_ids, truth_ids.shape[1])
@@ -153,6 +161,7 @@ def main() -> int:
         "query_count": args.query_count,
         "dimension": args.dimension,
         "k": args.k,
+        "kernel": args.kernel,
         "mean_recall_at_k": mean_recall,
         "minimum_recall_at_k": float(np.min(per_query_recall)),
         "exact_ranked_id_match": exact_id_match,

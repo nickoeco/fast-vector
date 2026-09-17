@@ -86,4 +86,39 @@ TEST(FlatIndexTest, RepeatedSearchDoesNotChangeState) {
     EXPECT_EQ(index.size(), 2U);
 }
 
+TEST(FlatIndexTest, OptimizedKernelsPreserveTopKIds) {
+    fast_vector::FlatIndex scalar(3, fast_vector::DotProductKernel::Scalar);
+    fast_vector::FlatIndex automatic(3, fast_vector::DotProductKernel::AutoVectorized);
+    for (fast_vector::VectorId id = 1; id <= 20; ++id) {
+        const std::vector<float> vector{
+            static_cast<float>(id), static_cast<float>(id % 7 + 1),
+            static_cast<float>(id % 5 + 2)};
+        scalar.add(id, vector);
+        automatic.add(id, vector);
+    }
+    const std::vector<float> query{0.5F, 1.5F, 2.5F};
+    const auto scalar_results = scalar.search(query, 10);
+    const auto automatic_results = automatic.search(query, 10);
+    ASSERT_EQ(automatic_results.size(), scalar_results.size());
+    for (std::size_t i = 0; i < scalar_results.size(); ++i) {
+        EXPECT_EQ(automatic_results[i].id, scalar_results[i].id);
+        EXPECT_NEAR(automatic_results[i].score, scalar_results[i].score, 1.0e-5F);
+    }
+
+    if (fast_vector::avx2_dot_product_available()) {
+        fast_vector::FlatIndex avx2(3, fast_vector::DotProductKernel::Avx2);
+        for (fast_vector::VectorId id = 1; id <= 20; ++id) {
+            avx2.add(id, std::vector<float>{
+                             static_cast<float>(id), static_cast<float>(id % 7 + 1),
+                             static_cast<float>(id % 5 + 2)});
+        }
+        const auto avx2_results = avx2.search(query, 10);
+        ASSERT_EQ(avx2_results.size(), scalar_results.size());
+        for (std::size_t i = 0; i < scalar_results.size(); ++i) {
+            EXPECT_EQ(avx2_results[i].id, scalar_results[i].id);
+            EXPECT_NEAR(avx2_results[i].score, scalar_results[i].score, 1.0e-5F);
+        }
+    }
+}
+
 }  // namespace

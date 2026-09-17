@@ -46,4 +46,30 @@ TEST(DistanceTest, RejectsMismatchedDotProductDimensions) {
         std::invalid_argument);
 }
 
+TEST(DistanceTest, OptimizedKernelsMatchScalarWithinTolerance) {
+    std::vector<float> lhs(37);
+    std::vector<float> rhs(37);
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        lhs[i] = static_cast<float>(i + 1) / 37.0F;
+        rhs[i] = static_cast<float>(37 - i) / 19.0F;
+    }
+
+    const float scalar = fast_vector::dot_product(
+        lhs, rhs, fast_vector::DotProductKernel::Scalar);
+    const float automatic = fast_vector::dot_product(
+        lhs, rhs, fast_vector::DotProductKernel::AutoVectorized);
+    EXPECT_NEAR(automatic, scalar, 1.0e-4F);
+
+    if (fast_vector::avx2_dot_product_available()) {
+        const float avx2 = fast_vector::dot_product(
+            lhs, rhs, fast_vector::DotProductKernel::Avx2);
+        EXPECT_NEAR(avx2, scalar, 1.0e-4F);
+    } else {
+        EXPECT_THROW(
+            static_cast<void>(fast_vector::dot_product(
+                lhs, rhs, fast_vector::DotProductKernel::Avx2)),
+            std::invalid_argument);
+    }
+}
+
 }  // namespace

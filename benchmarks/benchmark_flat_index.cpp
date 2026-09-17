@@ -39,6 +39,7 @@ struct BenchmarkConfig {
     std::size_t warmup_count = 20;
     std::size_t thread_count = 1;
     std::uint32_t seed = 20250908U;
+    fast_vector::DotProductKernel kernel = fast_vector::DotProductKernel::Scalar;
 };
 
 class TemporaryIndexFile {
@@ -106,6 +107,16 @@ BenchmarkConfig parse_arguments(const int argc, char* argv[]) {
                 throw std::invalid_argument("--seed must fit in uint32_t");
             }
             config.seed = static_cast<std::uint32_t>(seed);
+        } else if (option == "--kernel") {
+            if (value == "scalar") {
+                config.kernel = fast_vector::DotProductKernel::Scalar;
+            } else if (value == "auto") {
+                config.kernel = fast_vector::DotProductKernel::AutoVectorized;
+            } else if (value == "avx2") {
+                config.kernel = fast_vector::DotProductKernel::Avx2;
+            } else {
+                throw std::invalid_argument("--kernel must be scalar, auto, or avx2");
+            }
         } else {
             throw std::invalid_argument("unknown benchmark option: " + option);
         }
@@ -156,7 +167,8 @@ std::uint64_t non_negative_difference(
 
 void print_usage() {
     std::cerr << "Usage: fast_vector_benchmark [--vectors N] [--dimension D] "
-                 "[--queries Q] [--k K] [--warmup W] [--threads T] [--seed S]\n";
+                 "[--queries Q] [--k K] [--warmup W] [--threads T] [--seed S] "
+                 "[--kernel scalar|auto|avx2]\n";
 }
 
 }  // namespace
@@ -164,6 +176,10 @@ void print_usage() {
 int main(const int argc, char* argv[]) {
     try {
         const BenchmarkConfig config = parse_arguments(argc, argv);
+        if (config.kernel == fast_vector::DotProductKernel::Avx2 &&
+            !fast_vector::avx2_dot_product_available()) {
+            throw std::invalid_argument("--kernel avx2 is unavailable on this build or CPU");
+        }
         if (config.dimension >
             std::numeric_limits<std::size_t>::max() / config.query_count) {
             throw std::invalid_argument("query matrix size overflows");
@@ -182,7 +198,7 @@ int main(const int argc, char* argv[]) {
         }
 
         const auto rss_before_build = resident_set_size_bytes();
-        fast_vector::FlatIndex index(config.dimension);
+        fast_vector::FlatIndex index(config.dimension, config.kernel);
         const auto build_start = Clock::now();
         for (std::size_t i = 0; i < config.vector_count; ++i) {
             index.add(static_cast<fast_vector::VectorId>(i),
@@ -199,7 +215,7 @@ int main(const int argc, char* argv[]) {
 
         const auto load_start = Clock::now();
         const fast_vector::FlatIndex loaded_index =
-            fast_vector::load_flat_index(index_file.path());
+            fast_vector::load_flat_index(index_file.path(), config.kernel);
         const auto load_end = Clock::now();
         const auto rss_after_load = resident_set_size_bytes();
 
@@ -271,6 +287,8 @@ int main(const int argc, char* argv[]) {
                   << "Top-K: " << config.top_k << '\n'
                   << "Warmup queries: " << config.warmup_count << '\n'
                   << "Batch threads: " << batch_searcher.thread_count() << '\n'
+                  << "Dot-product kernel: "
+                  << fast_vector::dot_product_kernel_name(config.kernel) << '\n'
                   << "Random seed: " << config.seed << '\n'
                   << "Index build time (ms): " << build_ms << '\n'
                   << "Index save time (ms): " << save_ms << '\n'

@@ -123,6 +123,14 @@ TEST(FlatIndexIoTest, RoundTripSupportsEmptyIndex) {
     EXPECT_EQ(restored.size(), 0U);
 }
 
+TEST(FlatIndexIoTest, LoaderAppliesRequestedExecutionKernel) {
+    TemporaryIndexFile file;
+    fast_vector::save_flat_index(make_index(), file.path());
+    const auto restored = fast_vector::load_flat_index(
+        file.path(), fast_vector::DotProductKernel::AutoVectorized);
+    EXPECT_EQ(restored.kernel(), fast_vector::DotProductKernel::AutoVectorized);
+}
+
 TEST(FlatIndexIoTest, RejectsBadMagic) {
     TemporaryIndexFile file;
     fast_vector::save_flat_index(make_index(), file.path());

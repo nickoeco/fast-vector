@@ -68,7 +68,8 @@ std::size_t dimension_from_header(const std::string& header) {
     return fields.size() - 1;
 }
 
-fast_vector::FlatIndex load_vectors(const std::string& path) {
+fast_vector::FlatIndex load_vectors(
+    const std::string& path, const fast_vector::DotProductKernel kernel) {
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("cannot open vector CSV: " + path);
@@ -79,7 +80,7 @@ fast_vector::FlatIndex load_vectors(const std::string& path) {
         throw std::runtime_error("vector CSV is empty");
     }
     const std::size_t dimension = dimension_from_header(line);
-    fast_vector::FlatIndex index(dimension);
+    fast_vector::FlatIndex index(dimension, kernel);
 
     while (std::getline(input, line)) {
         if (line.empty()) {
@@ -123,16 +124,32 @@ std::size_t parse_k(const std::string_view text) {
     return k;
 }
 
+fast_vector::DotProductKernel parse_kernel(const std::string_view text) {
+    if (text == "scalar") {
+        return fast_vector::DotProductKernel::Scalar;
+    }
+    if (text == "auto") {
+        return fast_vector::DotProductKernel::AutoVectorized;
+    }
+    if (text == "avx2" && fast_vector::avx2_dot_product_available()) {
+        return fast_vector::DotProductKernel::Avx2;
+    }
+    throw std::invalid_argument("kernel must be scalar, auto, or an available avx2");
+}
+
 }  // namespace
 
 int main(const int argc, char* argv[]) {
-    if (argc != 5) {
-        std::cerr << "Usage: fast_vector_validate <vectors.csv> <queries.csv> <k> <results.csv>\n";
+    if (argc != 5 && argc != 6) {
+        std::cerr << "Usage: fast_vector_validate <vectors.csv> <queries.csv> <k> "
+                     "<results.csv> [scalar|auto|avx2]\n";
         return 2;
     }
 
     try {
-        const fast_vector::FlatIndex index = load_vectors(argv[1]);
+        const auto kernel = argc == 6 ? parse_kernel(argv[5])
+                                      : fast_vector::DotProductKernel::Scalar;
+        const fast_vector::FlatIndex index = load_vectors(argv[1], kernel);
         const auto queries = load_queries(argv[2], index.dimension());
         const std::size_t k = parse_k(argv[3]);
 
