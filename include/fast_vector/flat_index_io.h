@@ -10,6 +10,8 @@ namespace fast_vector {
 void save_flat_index(const FlatIndex& index, const std::filesystem::path& path);
 
 /** Load and validate a FlatIndex saved by save_flat_index(). */
-[[nodiscard]] FlatIndex load_flat_index(const std::filesystem::path& path);
+[[nodiscard]] FlatIndex load_flat_index(
+    const std::filesystem::path& path,
+    DotProductKernel kernel = DotProductKernel::Scalar);
 
 }  // namespace fast_vector

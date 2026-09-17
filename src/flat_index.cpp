@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "fast_vector/distance.h"
+#include "distance_kernels.h"
 
 namespace fast_vector {
 namespace {
@@ -25,7 +26,8 @@ struct BetterResult {
 
 }  // namespace
 
-FlatIndex::FlatIndex(const std::size_t dimension) : dimension_(dimension) {
+FlatIndex::FlatIndex(const std::size_t dimension, const DotProductKernel kernel)
+    : dimension_(dimension), kernel_(kernel) {
     if (dimension_ == 0) {
         throw std::invalid_argument("index dimension must be greater than zero");
     }
@@ -69,6 +71,8 @@ std::vector<SearchResult> FlatIndex::search(
     }
 
     const std::vector<float> normalized_query = normalize_l2(query);
+    const detail::RawDotProduct dot_product_kernel =
+        detail::resolve_dot_product_kernel(kernel_);
     const std::size_t result_count = std::min(k, size());
     if (result_count == 0) {
         return {};
@@ -78,7 +82,9 @@ std::vector<SearchResult> FlatIndex::search(
     for (std::size_t i = 0; i < size(); ++i) {
         const std::span<const float> stored_vector(
             vectors_.data() + i * dimension_, dimension_);
-        const SearchResult candidate{ids_[i], dot_product(normalized_query, stored_vector)};
+        const SearchResult candidate{
+            ids_[i],
+            dot_product_kernel(normalized_query.data(), stored_vector.data(), dimension_)};
 
         if (candidates.size() < result_count) {
             candidates.push(candidate);
@@ -104,6 +110,10 @@ std::size_t FlatIndex::size() const noexcept {
 
 std::size_t FlatIndex::dimension() const noexcept {
     return dimension_;
+}
+
+DotProductKernel FlatIndex::kernel() const noexcept {
+    return kernel_;
 }
 
 }  // namespace fast_vector

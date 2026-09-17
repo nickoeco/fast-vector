@@ -7,6 +7,7 @@ option(FAST_VECTOR_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(FAST_VECTOR_BUILD_VALIDATION "Build the cross-language validation runner" ON)
 option(FAST_VECTOR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(FAST_VECTOR_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
+option(FAST_VECTOR_ENABLE_AVX2 "Build the optional x86 AVX2 distance kernel" ON)
 
 if(FAST_VECTOR_ENABLE_SANITIZERS AND FAST_VECTOR_ENABLE_THREAD_SANITIZER)
     message(FATAL_ERROR "Address/Undefined sanitizers and ThreadSanitizer cannot be combined")
@@ -17,6 +18,7 @@ find_package(Threads REQUIRED)
 add_library(fast_vector
     src/batch_searcher.cpp
     src/distance.cpp
+    src/distance_auto.cpp
     src/flat_index.cpp
     src/flat_index_io.cpp
 )
@@ -29,6 +31,22 @@ target_include_directories(fast_vector
         $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(fast_vector PRIVATE Threads::Threads)
+
+if(MSVC)
+    set_source_files_properties(src/distance_auto.cpp PROPERTIES COMPILE_OPTIONS /fp:fast)
+else()
+    set_source_files_properties(src/distance_auto.cpp PROPERTIES COMPILE_OPTIONS -ffast-math)
+endif()
+
+if(FAST_VECTOR_ENABLE_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    target_sources(fast_vector PRIVATE src/distance_avx2.cpp)
+    target_compile_definitions(fast_vector PRIVATE FAST_VECTOR_HAS_AVX2_IMPL=1)
+    if(MSVC)
+        set_source_files_properties(src/distance_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+    else()
+        set_source_files_properties(src/distance_avx2.cpp PROPERTIES COMPILE_OPTIONS -mavx2)
+    endif()
+endif()
 
 function(fast_vector_set_warnings target)
     if(MSVC)

@@ -167,7 +167,7 @@ public:
         }
     }
 
-    static FlatIndex load(const std::filesystem::path& path) {
+    static FlatIndex load(const std::filesystem::path& path, const DotProductKernel kernel) {
         std::ifstream input(path, std::ios::binary);
         if (!input) {
             throw std::runtime_error("cannot open index for reading: " + path.string());
@@ -250,7 +250,7 @@ public:
             fail("payload checksum does not match");
         }
 
-        FlatIndex index(dimension);
+        FlatIndex index(dimension, kernel);
         index.ids_ = std::move(ids);
         index.id_set_ = std::move(id_set);
         index.vectors_ = std::move(vectors);
@@ -262,8 +262,8 @@ void save_flat_index(const FlatIndex& index, const std::filesystem::path& path) 
     FlatIndexSerializer::save(index, path);
 }
 
-FlatIndex load_flat_index(const std::filesystem::path& path) {
-    return FlatIndexSerializer::load(path);
+FlatIndex load_flat_index(const std::filesystem::path& path, const DotProductKernel kernel) {
+    return FlatIndexSerializer::load(path, kernel);
 }
 
 }  // namespace fast_vector
