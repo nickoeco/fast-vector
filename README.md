@@ -16,6 +16,7 @@ in-memory flat index using cosine similarity.
 - Cross-language correctness validation against exact NumPy ground truth
 - Versioned binary save/load for `FlatIndex`, with structural and checksum validation
 - Ordered batch search backed by a reusable fixed-size worker pool
+- Selectable scalar, compiler-auto-vectorized, and optional AVX2 dot-product kernels
 
 HNSW, deletion, batch operations, explicit SIMD, service APIs, and metadata storage are
 not implemented yet. Persistence currently means complete snapshot save/load; incremental
@@ -131,6 +132,7 @@ and a warm-up period. Parameters can be changed without editing source code:
   --k 20 \
   --warmup 20 \
   --threads 4 \
+  --kernel avx2 \
   --seed 20250908
 ```
 
@@ -143,6 +145,15 @@ does not claim per-request tail latency under concurrent service load. No perfor
 numbers are pre-recorded here because they depend on the machine, compiler, storage, and
 build flags.
 
+The default `scalar` kernel accumulates in `double` and remains the strict correctness
+reference. The `auto` kernel is isolated in one translation unit compiled with fast
+floating-point optimization so GCC or Clang may vectorize its float reduction. The optional
+`avx2` kernel uses explicit eight-float SIMD operations and scalar tail handling. AVX2 is
+compiled only for x86 targets and selected only after a runtime CPU capability check; asking
+for it when unavailable returns an error. Optimized reductions may differ from the scalar
+reference by small floating-point rounding amounts, so tests compare scores with a tolerance
+and require identical Top-K IDs on deterministic inputs.
+
 ## NumPy correctness validation
 
 The validation script generates deterministic float32 database and query vectors, writes
@@ -154,7 +165,8 @@ NumPy is a validation-only dependency:
 python3 -m pip install -r scripts/requirements.txt
 python3 scripts/validate_recall.py \
   --runner build-release/fast_vector_validate \
-  --output-dir validation-output
+  --output-dir validation-output \
+  --kernel scalar
 ```
 
 The generated directory contains the inputs, NumPy ground truth, C++ results, and a JSON

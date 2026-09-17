@@ -57,3 +57,19 @@ jobs:
         run: cmake --build build-tsan --parallel
       - name: Test
         run: ctest --test-dir build-tsan --output-on-failure
+
+  portable-no-avx2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without AVX2
+        run: |
+          cmake -S . -B build-noavx \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DFAST_VECTOR_ENABLE_AVX2=OFF \
+            -DFAST_VECTOR_BUILD_BENCHMARKS=OFF \
+            -DFAST_VECTOR_BUILD_VALIDATION=OFF
+      - name: Build
+        run: cmake --build build-noavx --parallel
+      - name: Test
+        run: ctest --test-dir build-noavx --output-on-failure
