@@ -1,8 +1,8 @@
 # fast-vector
 
 `fast-vector` is a small C++20 vector search engine built to make index design,
-correctness, and performance measurable. The current implementation is an exact
-in-memory flat index using cosine similarity.
+correctness, and performance measurable. It includes an exact in-memory flat index and
+a from-scratch approximate HNSW index using cosine similarity.
 
 ## Implemented features
 
@@ -17,10 +17,12 @@ in-memory flat index using cosine similarity.
 - Versioned binary save/load for `FlatIndex`, with structural and checksum validation
 - Ordered batch search backed by a reusable fixed-size worker pool
 - Selectable scalar, compiler-auto-vectorized, and optional AVX2 dot-product kernels
+- In-memory single-threaded HNSW construction and approximate cosine search
 
-HNSW, deletion, batch operations, explicit SIMD, service APIs, and metadata storage are
-not implemented yet. Persistence currently means complete snapshot save/load; incremental
-persistence is not implemented.
+HNSW persistence, deletion, service APIs, and metadata storage are not implemented yet.
+Persistence currently means complete `FlatIndex` snapshot save/load; incremental
+persistence is not implemented. The first HNSW implementation uses simple nearest-M
+neighbor selection; recall validation and the diversity heuristic are planned next.
 
 ## Requirements
 
@@ -101,6 +103,27 @@ candidates adds `O(N log K)` selection work and uses `O(K)` extra memory. Only t
 `K` candidates are sorted at the end, so the implementation does not allocate and sort
 all `N` scores.
 
+## HNSW index
+
+`HnswIndex` stores normalized vectors in the same contiguous row-major representation as
+`FlatIndex`, while graph nodes refer to them through compact 32-bit internal indexes.
+User-provided 64-bit IDs remain separate from graph topology. Random levels are generated
+from a fixed seed, high layers use greedy descent, and layer zero uses bounded candidate
+and result queues controlled by `ef_search`.
+
+The implementation follows the algorithm described by Malkov and Yashunin in
+[Efficient and robust approximate nearest neighbor search using Hierarchical Navigable
+Small World graphs](https://arxiv.org/abs/1603.09320). This repository implements its own
+level generation, graph traversal, bidirectional linking, bounded candidate search, and
+degree pruning; it does not wrap `hnswlib`, FAISS, or another vector-search library.
+
+Phase 4A deliberately uses a simple nearest-`M` connection rule instead of the paper's
+diversity-aware neighbor-selection heuristic. Consequently, this is a correctness-first
+implementation and no recall or performance claim is made yet. `M`, `ef_construction`,
+and `ef_search` are explicit configuration values. The per-call search overload raises
+an `ef_search` below `k` to `k`, because at least `k` retained candidates are required to
+return `k` results.
+
 ## Thread safety
 
 `FlatIndex` contains no internal synchronization. Concurrent calls to `search()` are
@@ -110,6 +133,10 @@ external synchronization. `BatchSearcher` owns persistent workers and performs c
 read-only calls while preserving input query order. The referenced index must outlive the
 searcher and remain immutable. Destroying a `BatchSearcher` concurrently with `search()` is
 unsupported.
+
+`HnswIndex` also contains no internal synchronization. Concurrent read-only searches are
+safe only after construction has finished. Insertion concurrent with search or another
+insertion is unsupported.
 
 ## Benchmark
 
@@ -211,9 +238,9 @@ in version 1, so callers should write to a new path before replacing an importan
 
 ## Roadmap
 
-Planned phases add persistence, then concurrency and SIMD, a from-scratch HNSW index,
-gRPC, embedding pipelines, and container deployment. The exact `FlatIndex` remains the
-correctness and recall baseline for those implementations.
+Planned work adds HNSW recall and latency evaluation, a diversity-aware neighbor-selection
+heuristic, gRPC, embedding pipelines, and container deployment. The exact `FlatIndex`
+remains the correctness and recall baseline for approximate indexes.
 
 ## License
 
