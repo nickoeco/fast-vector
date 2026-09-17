@@ -21,6 +21,7 @@ add_library(fast_vector
     src/distance_auto.cpp
     src/flat_index.cpp
     src/flat_index_io.cpp
+    src/hnsw_index.cpp
 )
 add_library(fast_vector::fast_vector ALIAS fast_vector)
 
@@ -98,6 +99,7 @@ if(FAST_VECTOR_BUILD_TESTS)
         tests/test_batch_searcher.cpp
         tests/test_flat_index.cpp
         tests/test_flat_index_io.cpp
+        tests/test_hnsw_index.cpp
     )
     target_link_libraries(fast_vector_tests PRIVATE fast_vector::fast_vector GTest::gtest_main)
     fast_vector_set_warnings(fast_vector_tests)
