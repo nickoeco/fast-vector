@@ -114,6 +114,11 @@ if(FAST_VECTOR_BUILD_BENCHMARKS)
     target_link_libraries(fast_vector_benchmark PRIVATE fast_vector::fast_vector)
     fast_vector_set_warnings(fast_vector_benchmark)
     fast_vector_enable_sanitizers(fast_vector_benchmark)
+
+    add_executable(fast_vector_hnsw_benchmark benchmarks/benchmark_hnsw.cpp)
+    target_link_libraries(fast_vector_hnsw_benchmark PRIVATE fast_vector::fast_vector)
+    fast_vector_set_warnings(fast_vector_hnsw_benchmark)
+    fast_vector_enable_sanitizers(fast_vector_hnsw_benchmark)
 endif()
 
 if(FAST_VECTOR_BUILD_VALIDATION)
