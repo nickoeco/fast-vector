@@ -8,6 +8,7 @@ option(FAST_VECTOR_BUILD_VALIDATION "Build the cross-language validation runner"
 option(FAST_VECTOR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(FAST_VECTOR_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
 option(FAST_VECTOR_ENABLE_AVX2 "Build the optional x86 AVX2 distance kernel" ON)
+option(FAST_VECTOR_BUILD_GRPC "Build the optional gRPC service" OFF)
 
 if(FAST_VECTOR_ENABLE_SANITIZERS AND FAST_VECTOR_ENABLE_THREAD_SANITIZER)
     message(FATAL_ERROR "Address/Undefined sanitizers and ThreadSanitizer cannot be combined")
@@ -128,4 +129,36 @@ if(FAST_VECTOR_BUILD_VALIDATION)
     target_link_libraries(fast_vector_validate PRIVATE fast_vector::fast_vector)
     fast_vector_set_warnings(fast_vector_validate)
     fast_vector_enable_sanitizers(fast_vector_validate)
+endif()
+
+if(FAST_VECTOR_BUILD_GRPC)
+    include(cmake/GrpcCodegen.cmake)
+
+    add_library(fast_vector_grpc_service service/vector_search_service.cpp)
+    target_include_directories(fast_vector_grpc_service PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fast_vector_grpc_service
+        PUBLIC fast_vector::fast_vector fast_vector_grpc_proto
+    )
+    fast_vector_set_warnings(fast_vector_grpc_service)
+    fast_vector_enable_sanitizers(fast_vector_grpc_service)
+
+    add_executable(fast_vector_server apps/server.cpp)
+    target_link_libraries(fast_vector_server PRIVATE fast_vector_grpc_service)
+    fast_vector_set_warnings(fast_vector_server)
+    fast_vector_enable_sanitizers(fast_vector_server)
+
+    if(FAST_VECTOR_BUILD_TESTS)
+        add_executable(fast_vector_grpc_tests tests/test_grpc_service.cpp)
+        target_link_libraries(fast_vector_grpc_tests
+            PRIVATE fast_vector_grpc_service GTest::gtest_main
+        )
+        if(FAST_VECTOR_ENABLE_SANITIZERS)
+            target_compile_definitions(fast_vector_grpc_tests
+                PRIVATE FAST_VECTOR_GRPC_SYSTEM_LIBRARY_SANITIZER_BOUNDARY=1
+            )
+        endif()
+        fast_vector_set_warnings(fast_vector_grpc_tests)
+        fast_vector_enable_sanitizers(fast_vector_grpc_tests)
+        gtest_discover_tests(fast_vector_grpc_tests TEST_PREFIX "Grpc")
+    endif()
 endif()
