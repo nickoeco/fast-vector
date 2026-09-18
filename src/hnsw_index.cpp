@@ -21,6 +21,9 @@ HnswConfig validate_config(HnswConfig config) {
   if (config.max_connections < 2) {
     throw std::invalid_argument("HNSW max_connections must be at least two");
   }
+  if (config.max_connections > std::numeric_limits<std::size_t>::max() / 2) {
+    throw std::invalid_argument("HNSW max_connections is too large");
+  }
   if (config.ef_construction < config.max_connections) {
     throw std::invalid_argument("HNSW ef_construction must be at least max_connections");
   }
@@ -72,7 +75,8 @@ void HnswIndex::add(const VectorId id, const std::span<const float> vector) {
   for (std::size_t current_level = first_connected_level + 1; current_level-- > 0;) {
     const std::vector<Candidate> candidates =
         search_layer(normalized, entry, config_.ef_construction, current_level);
-    connection_plan[current_level] = select_neighbors(candidates);
+    connection_plan[current_level] =
+        select_neighbors(candidates, maximum_connections(current_level));
     if (!candidates.empty()) {
       entry = candidates.front().node;
     }
@@ -251,39 +255,80 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const 
 }
 
 std::vector<HnswIndex::NodeIndex> HnswIndex::select_neighbors(
-    const std::vector<Candidate>& candidates) const {
-  const std::size_t count = std::min(config_.max_connections, candidates.size());
+    const std::vector<Candidate>& candidates, const std::size_t maximum_count) const {
+  const std::size_t count = std::min(maximum_count, candidates.size());
   std::vector<NodeIndex> selected;
   selected.reserve(count);
-  for (std::size_t i = 0; i < count; ++i) {
-    selected.push_back(candidates[i].node);
+
+  if (config_.neighbor_selection == HnswNeighborSelection::Simple) {
+    for (std::size_t i = 0; i < count; ++i) {
+      selected.push_back(candidates[i].node);
+    }
+    return selected;
+  }
+
+  std::vector<NodeIndex> pruned;
+  pruned.reserve(candidates.size());
+  for (const Candidate& candidate : candidates) {
+    bool diverse = true;
+    const std::span<const float> candidate_vector(
+        vectors_.data() + static_cast<std::size_t>(candidate.node) * config_.dimension,
+        config_.dimension);
+    for (const NodeIndex selected_node : selected) {
+      // For cosine distance, d(c, r) > d(c, q) becomes sim(c, r) < sim(c, q).
+      if (similarity(candidate_vector, selected_node) >= candidate.score) {
+        diverse = false;
+        break;
+      }
+    }
+    if (diverse && selected.size() < count) {
+      selected.push_back(candidate.node);
+    } else {
+      pruned.push_back(candidate.node);
+    }
+  }
+
+  // Filling rejected candidates keeps graph degree predictable on clustered data.
+  for (const NodeIndex candidate : pruned) {
+    if (selected.size() == count) {
+      break;
+    }
+    selected.push_back(candidate);
   }
   return selected;
 }
 
+std::size_t HnswIndex::maximum_connections(const std::size_t level) const noexcept {
+  // The dense base layer improves connectivity; upper layers remain sparse shortcuts.
+  return level == 0 ? config_.max_connections * 2 : config_.max_connections;
+}
+
 void HnswIndex::prune_neighbors(const NodeIndex node, const std::size_t level) {
   std::vector<NodeIndex>& neighbors = graph_[node].levels[level];
-  if (neighbors.size() <= config_.max_connections) {
+  const std::size_t maximum_count = maximum_connections(level);
+  if (neighbors.size() <= maximum_count) {
     return;
   }
 
   const std::span<const float> owner(
       vectors_.data() + static_cast<std::size_t>(node) * config_.dimension, config_.dimension);
-  std::sort(neighbors.begin(), neighbors.end(),
-            [this, owner](const NodeIndex lhs, const NodeIndex rhs) {
-              return is_better(Candidate{lhs, similarity(owner, lhs)},
-                               Candidate{rhs, similarity(owner, rhs)});
-            });
-  neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
-  if (neighbors.size() > config_.max_connections) {
-    const std::vector<NodeIndex> removed(neighbors.begin() + config_.max_connections,
-                                         neighbors.end());
-    neighbors.resize(config_.max_connections);
-    for (const NodeIndex removed_neighbor : removed) {
+  std::vector<Candidate> candidates;
+  candidates.reserve(neighbors.size());
+  for (const NodeIndex neighbor : neighbors) {
+    candidates.push_back(Candidate{neighbor, similarity(owner, neighbor)});
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [this](const Candidate& lhs, const Candidate& rhs) { return is_better(lhs, rhs); });
+  const std::vector<NodeIndex> selected = select_neighbors(candidates, maximum_count);
+
+  for (const NodeIndex previous_neighbor : neighbors) {
+    if (std::find(selected.begin(), selected.end(), previous_neighbor) == selected.end()) {
+      const NodeIndex removed_neighbor = previous_neighbor;
       std::vector<NodeIndex>& reverse = graph_[removed_neighbor].levels[level];
       std::erase(reverse, node);
     }
   }
+  neighbors = selected;
 }
 
 }  // namespace fast_vector

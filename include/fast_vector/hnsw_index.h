@@ -12,6 +12,12 @@
 
 namespace fast_vector {
 
+/** Strategy used to choose graph neighbors from a similarity-ranked candidate list. */
+enum class HnswNeighborSelection {
+  Simple,
+  Heuristic,
+};
+
 /** Construction and default search parameters for an in-memory HNSW index. */
 struct HnswConfig {
   std::size_t dimension;
@@ -20,6 +26,7 @@ struct HnswConfig {
   std::size_t ef_search = 50;
   std::uint64_t random_seed = 42;
   DotProductKernel kernel = DotProductKernel::Scalar;
+  HnswNeighborSelection neighbor_selection = HnswNeighborSelection::Simple;
 };
 
 /** Lightweight structural counters for validation and benchmark reporting. */
@@ -69,8 +76,9 @@ class HnswIndex final : public VectorIndex {
                                               std::size_t level) const;
   [[nodiscard]] std::vector<Candidate> search_layer(std::span<const float> query, NodeIndex entry,
                                                     std::size_t ef, std::size_t level) const;
-  [[nodiscard]] std::vector<NodeIndex> select_neighbors(
-      const std::vector<Candidate>& candidates) const;
+  [[nodiscard]] std::vector<NodeIndex> select_neighbors(const std::vector<Candidate>& candidates,
+                                                        std::size_t maximum_count) const;
+  [[nodiscard]] std::size_t maximum_connections(std::size_t level) const noexcept;
   void prune_neighbors(NodeIndex node, std::size_t level);
 
   HnswConfig config_;
