@@ -225,6 +225,39 @@ explicit validation threshold, not a universal HNSW guarantee; data distribution
 order, parameters, and seed all affect recall. Scores are independently checked against the
 exact cosine score of each ID actually returned by HNSW.
 
+## HNSW benchmark
+
+The dedicated Release benchmark builds `FlatIndex` and `HnswIndex` from the same generated
+vectors. Flat search supplies both the exact Top-K baseline and its own latency measurement.
+HNSW is then queried at each requested `efSearch` value:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --parallel
+./build-release/fast_vector_hnsw_benchmark \
+  --vectors 10000 \
+  --dimension 128 \
+  --queries 1000 \
+  --k 10 \
+  --m 16 \
+  --ef-construction 200 \
+  --ef-search 10,50,100,200 \
+  --neighbor-selection heuristic \
+  --seed 20250908 \
+  --hnsw-seed 42
+```
+
+The output separates Flat and HNSW construction time, Flat latency and QPS, and an HNSW
+table containing mean/minimum Recall@K, average latency, P50/P95/P99, and QPS for every
+`efSearch`. It also reports graph degree counters, vector/ID payload bytes, adjacency-edge
+payload bytes, and approximate process RSS deltas. Payload values intentionally exclude
+container, hash-table, allocator, and alignment overhead; RSS includes unrelated process
+memory and allocator behavior. Neither value is an exact retained-memory measurement.
+
+Queries run sequentially in-process, so these figures measure a single-thread algorithmic
+tradeoff rather than concurrent service latency. Results are not pre-recorded because they
+depend on CPU, compiler, kernel, workload, parameters, and build flags.
+
 ## Binary index persistence
 
 `FlatIndex` snapshots preserve normalized float32 vectors and IDs exactly:
