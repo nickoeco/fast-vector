@@ -19,14 +19,14 @@ a from-scratch approximate HNSW index using cosine similarity.
 - Selectable scalar, compiler-auto-vectorized, and optional AVX2 dot-product kernels
 - In-memory single-threaded HNSW construction and approximate cosine search
 - Thread-safe `VectorStore` application layer with serialized insertion and concurrent search
-- Versioned protobuf service contract for the upcoming gRPC transport
+- Optional synchronous gRPC server with protobuf code generation and standard health checks
 
-HNSW persistence, deletion, the gRPC transport, and metadata storage are not implemented yet.
+HNSW persistence, deletion, authentication, TLS, and metadata storage are not implemented yet.
 Persistence currently means complete `FlatIndex` snapshot save/load; incremental
 persistence is not implemented. HNSW supports both simple nearest-M and diversity-aware
 neighbor selection, with reproducible Recall@K validation against NumPy ground truth.
-The protobuf contract is present, but the gRPC server and generated protobuf code are not
-built yet.
+The gRPC transport supports insertion, non-transactional batch insertion, search, statistics,
+deadlines, bounded request messages, and the standard gRPC health protocol.
 
 ## Requirements
 
@@ -34,6 +34,9 @@ built yet.
 - A C++20 compiler (GCC or Clang)
 - Network access during the first test configuration: CMake FetchContent downloads
   GoogleTest 1.15.2. The library and demo have no runtime third-party dependencies.
+- Optional gRPC build: protobuf compiler and development files, the gRPC C++ development
+  package, and `grpc_cpp_plugin`. On Ubuntu 22.04/WSL2 these are available through
+  `protobuf-compiler`, `protobuf-compiler-grpc`, `libprotobuf-dev`, and `libgrpc++-dev`.
 
 ## Build and test
 
@@ -158,8 +161,58 @@ batch elements were inserted, so BatchAdd is explicitly not transactional in thi
 
 The transport-neutral protobuf contract lives in
 `proto/fast_vector/v1/vector_search.proto`. Generated protobuf files are intentionally not
-committed. gRPC remains an optional future build component; the current core build requires
-no protobuf or gRPC installation.
+committed. The core build keeps gRPC disabled by default and therefore requires no protobuf
+or gRPC installation.
+
+## gRPC service
+
+Install the optional build dependencies on Ubuntu 22.04/WSL2, then configure explicitly:
+
+```bash
+sudo apt update
+sudo apt install protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev
+
+cmake -S . -B build-grpc \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFAST_VECTOR_BUILD_GRPC=ON
+cmake --build build-grpc --parallel
+ctest --test-dir build-grpc --output-on-failure
+```
+
+Generated C++ protobuf sources stay under the build directory. CMake first uses installed
+gRPC package targets when available and otherwise falls back to `pkg-config`, which supports
+the Ubuntu 22.04 packages. With those system packages, the expired-deadline integration test
+is skipped only in an ASan/UBSan build because gRPC 1.30's uninstrumented `ClientContext`
+cleanup is incompatible with the instrumented caller; Debug and Release builds execute it.
+
+Start an empty HNSW-backed server with a fixed dimension:
+
+```bash
+./build-grpc/fast_vector_server \
+  --address 0.0.0.0:50051 \
+  --index hnsw \
+  --dimension 128 \
+  --max-batch-size 1000 \
+  --max-message-bytes 16777216 \
+  --kernel auto \
+  --m 16 \
+  --ef-construction 200 \
+  --ef-search 100 \
+  --hnsw-seed 42 \
+  --neighbor-selection heuristic
+```
+
+Use `--index flat` for exact search; HNSW-only options are then ignored. The synchronous
+server lets gRPC schedule independent requests concurrently. `VectorStore` permits concurrent
+searches but serializes each insertion or batch against all other operations. RPC input errors
+map to `INVALID_ARGUMENT`, oversized configured batches to `RESOURCE_EXHAUSTED`, and expired
+deadlines to `DEADLINE_EXCEEDED`. Message size is bounded separately by
+`--max-message-bytes`. Batch insertion is not transactional when an ID already exists in the
+index, as described above.
+
+The server enables gRPC's standard health-check service. Transport security, authentication,
+index loading, persistence during service operation, reflection, and production observability
+are outside this phase.
 
 ## Benchmark
 
@@ -318,9 +371,9 @@ in version 1, so callers should write to a new path before replacing an importan
 
 ## Roadmap
 
-Planned work adds HNSW latency evaluation and parameter sweeps, gRPC, embedding pipelines,
-and container deployment. The exact `FlatIndex` remains the correctness and recall baseline
-for approximate indexes.
+Planned work adds a Python gRPC client and concurrent load test, embedding pipelines,
+metadata mapping, transport security, and container deployment. The exact `FlatIndex`
+remains the correctness and recall baseline for approximate indexes.
 
 ## License
 
