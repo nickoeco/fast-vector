@@ -73,3 +73,24 @@ jobs:
         run: cmake --build build-noavx --parallel
       - name: Test
         run: ctest --test-dir build-noavx --output-on-failure
+
+  grpc-integration:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gRPC dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev
+      - name: Configure
+        run: |
+          cmake -S . -B build-grpc \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DFAST_VECTOR_BUILD_GRPC=ON \
+            -DFAST_VECTOR_BUILD_BENCHMARKS=OFF \
+            -DFAST_VECTOR_BUILD_VALIDATION=OFF
+      - name: Build
+        run: cmake --build build-grpc --parallel
+      - name: Test
+        run: ctest --test-dir build-grpc --output-on-failure
