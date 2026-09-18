@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package fast_vector.v1;
+
+message Vector {
+  uint64 id = 1;
+  repeated float values = 2;
+}
+
+message AddVectorRequest {
+  Vector vector = 1;
+}
+
+message AddVectorResponse {
+  uint64 index_size = 1;
+}
+
+message BatchAddRequest {
+  repeated Vector vectors = 1;
+}
+
+message BatchAddResponse {
+  uint64 added_count = 1;
+  uint64 index_size = 2;
+}
+
+message SearchRequest {
+  repeated float query = 1;
+  uint32 k = 2;
+}
+
+message Neighbor {
+  uint64 id = 1;
+  float score = 2;
+}
+
+message SearchResponse {
+  repeated Neighbor neighbors = 1;
+}
+
+message GetStatsRequest {}
+
+message GetStatsResponse {
+  string index_type = 1;
+  uint64 vector_count = 2;
+  uint64 dimension = 3;
+  uint64 successful_queries = 4;
+  uint64 failed_queries = 5;
+  uint64 inserted_vectors = 6;
+}
+
+service VectorSearchService {
+  rpc AddVector(AddVectorRequest) returns (AddVectorResponse);
+  rpc BatchAdd(BatchAddRequest) returns (BatchAddResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+}
