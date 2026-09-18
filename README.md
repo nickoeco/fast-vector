@@ -21,8 +21,8 @@ a from-scratch approximate HNSW index using cosine similarity.
 
 HNSW persistence, deletion, service APIs, and metadata storage are not implemented yet.
 Persistence currently means complete `FlatIndex` snapshot save/load; incremental
-persistence is not implemented. The first HNSW implementation uses simple nearest-M
-neighbor selection; recall validation and the diversity heuristic are planned next.
+persistence is not implemented. HNSW supports both simple nearest-M and diversity-aware
+neighbor selection, with reproducible Recall@K validation against NumPy ground truth.
 
 ## Requirements
 
@@ -117,12 +117,11 @@ Small World graphs](https://arxiv.org/abs/1603.09320). This repository implement
 level generation, graph traversal, bidirectional linking, bounded candidate search, and
 degree pruning; it does not wrap `hnswlib`, FAISS, or another vector-search library.
 
-Phase 4A deliberately uses a simple nearest-`M` connection rule instead of the paper's
-diversity-aware neighbor-selection heuristic. Consequently, this is a correctness-first
-implementation and no recall or performance claim is made yet. `M`, `ef_construction`,
-and `ef_search` are explicit configuration values. The per-call search overload raises
-an `ef_search` below `k` to `k`, because at least `k` retained candidates are required to
-return `k` results.
+The configuration can select either simple nearest-`M` connections or the paper's
+diversity-aware rule. Layer zero permits up to `2M` connections while sparse upper layers
+permit `M`. `M`, `ef_construction`, and `ef_search` are explicit configuration values.
+The per-call search overload raises an `ef_search` below `k` to `k`, because at least `k`
+retained candidates are required to return `k` results.
 
 ## Thread safety
 
@@ -202,6 +201,30 @@ every query, an identical ranked ID sequence, and a maximum absolute score diffe
 greater than `1e-5`. Both sides use descending score and ascending vector ID as the
 deterministic tie-break rule.
 
+The same script can evaluate approximate HNSW results against the exact NumPy baseline:
+
+```bash
+python3 scripts/validate_recall.py \
+  --runner build-release/fast_vector_validate \
+  --output-dir validation-output/hnsw \
+  --index hnsw \
+  --vector-count 10000 \
+  --query-count 100 \
+  --dimension 128 \
+  --k 10 \
+  --m 16 \
+  --ef-construction 200 \
+  --ef-search 200 \
+  --neighbor-selection heuristic \
+  --minimum-recall 0.85
+```
+
+Recall@K is the fraction of exact Top-K IDs also present in the approximate Top-K,
+averaged across queries. It ignores rank within the Top-K set. The optional minimum is an
+explicit validation threshold, not a universal HNSW guarantee; data distribution, insertion
+order, parameters, and seed all affect recall. Scores are independently checked against the
+exact cosine score of each ID actually returned by HNSW.
+
 ## Binary index persistence
 
 `FlatIndex` snapshots preserve normalized float32 vectors and IDs exactly:
@@ -238,9 +261,9 @@ in version 1, so callers should write to a new path before replacing an importan
 
 ## Roadmap
 
-Planned work adds HNSW recall and latency evaluation, a diversity-aware neighbor-selection
-heuristic, gRPC, embedding pipelines, and container deployment. The exact `FlatIndex`
-remains the correctness and recall baseline for approximate indexes.
+Planned work adds HNSW latency evaluation and parameter sweeps, gRPC, embedding pipelines,
+and container deployment. The exact `FlatIndex` remains the correctness and recall baseline
+for approximate indexes.
 
 ## License
 
