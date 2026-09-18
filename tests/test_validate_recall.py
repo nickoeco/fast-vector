@@ -5,7 +5,12 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.validate_recall import exact_top_k, read_cpp_results
+from scripts.validate_recall import (
+    exact_top_k,
+    read_cpp_results,
+    recall_at_k,
+    scores_for_result_ids,
+)
 
 
 class GroundTruthTest(unittest.TestCase):
@@ -29,6 +34,23 @@ class GroundTruthTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "duplicate query rank"):
                 read_cpp_results(path, np.array([0], dtype=np.uint64), 2)
+
+    def test_recall_at_k_uses_set_overlap_per_query(self) -> None:
+        expected = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint64)
+        actual = np.array([[3, 2, 9], [7, 8, 9]], dtype=np.uint64)
+
+        np.testing.assert_allclose(recall_at_k(expected, actual), np.array([2 / 3, 0.0]))
+
+    def test_scores_for_result_ids_follows_approximate_result_order(self) -> None:
+        vector_ids = np.array([10, 20], dtype=np.uint64)
+        vectors = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+        queries = np.array([[1.0, 0.0]], dtype=np.float32)
+        result_ids = np.array([[20, 10]], dtype=np.uint64)
+
+        np.testing.assert_allclose(
+            scores_for_result_ids(vector_ids, vectors, queries, result_ids),
+            np.array([[0.0, 1.0]]),
+        )
 
 
 if __name__ == "__main__":
