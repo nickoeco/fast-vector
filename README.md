@@ -18,11 +18,15 @@ a from-scratch approximate HNSW index using cosine similarity.
 - Ordered batch search backed by a reusable fixed-size worker pool
 - Selectable scalar, compiler-auto-vectorized, and optional AVX2 dot-product kernels
 - In-memory single-threaded HNSW construction and approximate cosine search
+- Thread-safe `VectorStore` application layer with serialized insertion and concurrent search
+- Versioned protobuf service contract for the upcoming gRPC transport
 
-HNSW persistence, deletion, service APIs, and metadata storage are not implemented yet.
+HNSW persistence, deletion, the gRPC transport, and metadata storage are not implemented yet.
 Persistence currently means complete `FlatIndex` snapshot save/load; incremental
 persistence is not implemented. HNSW supports both simple nearest-M and diversity-aware
 neighbor selection, with reproducible Recall@K validation against NumPy ground truth.
+The protobuf contract is present, but the gRPC server and generated protobuf code are not
+built yet.
 
 ## Requirements
 
@@ -136,6 +140,26 @@ unsupported.
 `HnswIndex` also contains no internal synchronization. Concurrent read-only searches are
 safe only after construction has finished. Insertion concurrent with search or another
 insertion is unsupported.
+
+## Application layer
+
+`VectorStore` owns one `VectorIndex` and supplies the synchronization boundary needed by a
+future service adapter. Searches take a shared lock, so multiple read-only requests can run
+concurrently. Single and batch insertion take an exclusive lock and therefore block all
+searches for the duration of the mutation. Counters track successful and failed searches
+plus vectors inserted through the store; they do not infer vectors that may have existed in
+an index before ownership was transferred.
+
+Batch insertion checks the configured batch limit, dimensions, finite values, zero vectors,
+and duplicate IDs within the request before taking the write lock. This validation performs
+an extra normalization pass but prevents those request-local errors from partially changing
+the index. A collision with an ID already stored in the index can still fail after earlier
+batch elements were inserted, so BatchAdd is explicitly not transactional in this version.
+
+The transport-neutral protobuf contract lives in
+`proto/fast_vector/v1/vector_search.proto`. Generated protobuf files are intentionally not
+committed. gRPC remains an optional future build component; the current core build requires
+no protobuf or gRPC installation.
 
 ## Benchmark
 
