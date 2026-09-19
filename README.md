@@ -214,6 +214,60 @@ The server enables gRPC's standard health-check service. Transport security, aut
 index loading, persistence during service operation, reflection, and production observability
 are outside this phase.
 
+### Python client and service load test
+
+Keep the Python gRPC toolchain isolated and generate the client modules from the checked-in
+contract:
+
+```bash
+python3 -m venv build/python-grpc-venv
+build/python-grpc-venv/bin/python -m pip install -r scripts/requirements-grpc.txt
+build/python-grpc-venv/bin/python scripts/generate_grpc_python.py \
+  --output-dir build/python-grpc
+```
+
+With `fast_vector_server` running on `127.0.0.1:50051`, the command-line client can insert,
+batch insert from JSON, search, and read service statistics:
+
+```bash
+build/python-grpc-venv/bin/python scripts/grpc_client.py add \
+  --id 101 --vector 1,0,0
+
+build/python-grpc-venv/bin/python scripts/grpc_client.py search \
+  --query 1,0,0 --k 10
+
+build/python-grpc-venv/bin/python scripts/grpc_client.py stats
+```
+
+`batch-add --input vectors.json` expects a JSON array such as
+`[{"id": 101, "values": [1.0, 0.0, 0.0]}]`. Global options such as `--address`,
+`--generated-dir`, and `--timeout` must appear before the subcommand.
+
+The load-test client can optionally own the local server process, which makes one command
+reproducible and guarantees cleanup:
+
+```bash
+build/python-grpc-venv/bin/python scripts/benchmark_grpc.py \
+  --server-executable build-grpc-release/fast_vector_server \
+  --address 127.0.0.1:50052 \
+  --generated-dir build/python-grpc \
+  --index hnsw \
+  --vectors 10000 \
+  --dimension 128 \
+  --queries 1000 \
+  --k 10 \
+  --workers 4 \
+  --batch-size 500 \
+  --warmup 20 \
+  --seed 20250908
+```
+
+The JSON report separates index population time from concurrent query wall time and reports
+successful and failed requests, errors grouped by gRPC status, QPS, and average/P50/P95/P99
+client-observed latency. The measurements include serialization, localhost transport, gRPC
+scheduling, lock contention, and search. This is a controlled development benchmark, not a
+production capacity claim, and the README intentionally contains no pre-recorded numbers.
+
 ## Benchmark
 
 Build and run in Release mode:

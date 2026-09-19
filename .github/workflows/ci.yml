@@ -78,6 +78,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
       - name: Install gRPC dependencies
         run: |
           sudo apt-get update
@@ -94,3 +97,9 @@ jobs:
         run: cmake --build build-grpc --parallel
       - name: Test
         run: ctest --test-dir build-grpc --output-on-failure
+      - name: Install Python gRPC dependencies
+        run: python -m pip install -r scripts/requirements-grpc.txt
+      - name: Test Python gRPC client
+        env:
+          FAST_VECTOR_SERVER: build-grpc/fast_vector_server
+        run: python -m unittest -v tests/grpc_python_test.py
