@@ -268,6 +268,45 @@ client-observed latency. The measurements include serialization, localhost trans
 scheduling, lock contention, and search. This is a controlled development benchmark, not a
 production capacity claim, and the README intentionally contains no pre-recorded numbers.
 
+## Embedding dataset pipeline
+
+Phase 6 begins with an offline, reproducible boundary between text processing and vector
+serving. Input is UTF-8 JSONL with one unique `document_id`, `text`, and optional `source`
+per line. Install the optional model dependency in a separate environment and build an
+example dataset:
+
+```bash
+python3 -m venv build/embedding-venv
+build/embedding-venv/bin/python -m pip install -r scripts/requirements-embedding.txt
+build/embedding-venv/bin/python scripts/build_embedding_dataset.py \
+  --input examples/documents.jsonl \
+  --output-dir build/embedding-example \
+  --model sentence-transformers/all-MiniLM-L6-v2 \
+  --maximum-words 120 \
+  --overlap-words 20 \
+  --batch-size 32 \
+  --device cpu
+```
+
+Whitespace-normalized text is split into deterministic overlapping word windows. Each vector
+ID is a stable 64-bit BLAKE2b digest of `(document_id, chunk_id)`; collisions are checked
+within the generated dataset. Sentence Transformers returns normalized float embeddings,
+which are validated again before export. The default
+[`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+model produces 384-dimensional embeddings.
+
+The output keeps vector-index data and application chunk records separate:
+
+- `vectors.jsonl` contains only vector IDs and float arrays for ingestion.
+- `chunks.jsonl` maps IDs to chunk records. Each record contains the text payload plus
+  descriptive metadata such as document ID, chunk number, and source.
+- `manifest.json` records format version, model, dimension, chunk settings, and filenames.
+
+Model weights are downloaded from Hugging Face on first use and are not committed. Word-based
+chunk sizes are intentionally simple and measurable; they are not model-token limits. Query
+embedding, gRPC ingestion of this JSONL format, and result-to-chunk lookup are the next
+application stage.
+
 ## Benchmark
 
 Build and run in Release mode:
