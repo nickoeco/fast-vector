@@ -1,0 +1,3 @@
+{"document_id":"vector-search","source":"example","text":"Vector search retrieves items by comparing dense numerical embeddings. Cosine similarity measures the angle between vectors."}
+{"document_id":"flat-index","source":"example","text":"A flat index compares the query with every stored vector. It provides exact results and is useful as a correctness baseline."}
+{"document_id":"hnsw-index","source":"example","text":"HNSW builds a layered proximity graph for approximate nearest neighbor search. Its efSearch parameter trades latency for recall."}
