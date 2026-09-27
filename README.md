@@ -303,9 +303,35 @@ The output keeps vector-index data and application chunk records separate:
 - `manifest.json` records format version, model, dimension, chunk settings, and filenames.
 
 Model weights are downloaded from Hugging Face on first use and are not committed. Word-based
-chunk sizes are intentionally simple and measurable; they are not model-token limits. Query
-embedding, gRPC ingestion of this JSONL format, and result-to-chunk lookup are the next
-application stage.
+chunk sizes are intentionally simple and measurable; they are not model-token limits.
+
+Build the Python gRPC modules once, then run the complete semantic-search path. Supplying a
+server executable creates an empty index with the manifest dimension, ingests `vectors.jsonl`,
+embeds the query with the manifest model, searches, maps result IDs through `chunks.jsonl`, and
+stops the server:
+
+```bash
+build/embedding-venv/bin/python -m pip install -r scripts/requirements-grpc.txt
+build/embedding-venv/bin/python scripts/generate_grpc_python.py \
+  --output-dir build/python-grpc
+build/embedding-venv/bin/python scripts/semantic_search.py \
+  --dataset-dir build/embedding-example \
+  --query "Which index provides exact search results?" \
+  --k 3 \
+  --batch-size 500 \
+  --address 127.0.0.1:50054 \
+  --server-executable build-grpc-release/fast_vector_server \
+  --index flat \
+  --generated-dir build/python-grpc \
+  --device cpu
+```
+
+The loader rejects unsupported manifests, duplicate IDs, wrong dimensions, count mismatches,
+and any difference between the vector and chunk ID sets before modifying the service. Use
+`--skip-ingest` only when connecting to a service already populated with exactly the same
+dataset; repeating ingestion against the same in-memory index produces duplicate-ID errors.
+The output is retrieval evidence—scores and matched chunks—not a generated answer. LLM-based
+RAG remains outside the implemented scope.
 
 ## Benchmark
 

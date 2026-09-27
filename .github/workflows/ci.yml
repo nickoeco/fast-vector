@@ -102,4 +102,6 @@ jobs:
       - name: Test Python gRPC client
         env:
           FAST_VECTOR_SERVER: build-grpc/fast_vector_server
-        run: python -m unittest -v tests/grpc_python_test.py
+        run: |
+          python -m unittest -v tests/grpc_python_test.py
+          python -m unittest -v tests/semantic_search_test.py
