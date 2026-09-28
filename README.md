@@ -488,11 +488,42 @@ cryptographic authenticity mechanism. The format does not serialize C++ containe
 or pointers, and loading rebuilds the duplicate-ID set. Snapshot writes are not crash-atomic
 in version 1, so callers should write to a new path before replacing an important snapshot.
 
+## Container deployment
+
+The multi-stage Docker build compiles the optional gRPC server on Ubuntu 22.04 and copies only
+the server plus its runtime libraries into the final image. The process runs as the non-root
+UID `10001`; build tools, source files, tests, and generated protobuf sources are absent from
+the runtime stage.
+
+```bash
+docker build -t fast-vector:local .
+docker run --rm -p 50051:50051 fast-vector:local \
+  --address 0.0.0.0:50051 \
+  --index flat \
+  --dimension 384 \
+  --max-batch-size 1000 \
+  --kernel auto
+```
+
+The image includes a TCP liveness check. Docker Compose also supplies the documented HNSW
+defaults, graceful SIGTERM shutdown, and restart policy:
+
+```bash
+docker compose --project-name fast-vector config --quiet
+docker compose --project-name fast-vector up --build
+docker compose --project-name fast-vector down
+```
+
+The health check verifies that the server accepts TCP connections on port 50051; it does not
+issue the standard gRPC health RPC. The image currently starts an empty in-memory index, uses
+insecure gRPC, and has no persistent volume. Container image publishing, Kubernetes probes,
+resource policies, and index snapshot loading are later deployment stages.
+
 ## Roadmap
 
-Planned work adds a Python gRPC client and concurrent load test, embedding pipelines,
-metadata mapping, transport security, and container deployment. The exact `FlatIndex`
-remains the correctness and recall baseline for approximate indexes.
+Planned work adds Kubernetes manifests, transport security, index startup loading,
+production observability, and final reproducible experiment documentation. The exact
+`FlatIndex` remains the correctness and recall baseline for approximate indexes.
 
 ## License
 

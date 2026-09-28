@@ -105,3 +105,34 @@ jobs:
         run: |
           python -m unittest -v tests/grpc_python_test.py
           python -m unittest -v tests/semantic_search_test.py
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose --project-name fast-vector config --quiet
+      - name: Build runtime image
+        run: docker build --tag fast-vector:ci .
+      - name: Smoke test runtime image
+        run: |
+          docker run --detach --name fast-vector-ci fast-vector:ci \
+            --address 0.0.0.0:50051 \
+            --index flat \
+            --dimension 3 \
+            --max-batch-size 10
+          for attempt in {1..30}; do
+            status="$(docker inspect --format='{{.State.Health.Status}}' fast-vector-ci)"
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              break
+            fi
+            sleep 1
+          done
+          docker logs fast-vector-ci
+          exit 1
+      - name: Remove smoke-test container
+        if: always()
+        run: docker rm --force fast-vector-ci || true
