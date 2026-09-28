@@ -1,0 +1,12 @@
+.git
+.github
+.cache
+.idea
+.vscode
+.venv
+build
+build-*
+validation-output
+__pycache__
+*.pyc
+*.pyo

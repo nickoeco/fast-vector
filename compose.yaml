@@ -1,0 +1,39 @@
+services:
+  fast-vector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fast-vector:local
+    init: true
+    ports:
+      - "50051:50051"
+    command:
+      - --address
+      - 0.0.0.0:50051
+      - --index
+      - hnsw
+      - --dimension
+      - "384"
+      - --max-batch-size
+      - "1000"
+      - --kernel
+      - auto
+      - --m
+      - "16"
+      - --ef-construction
+      - "200"
+      - --ef-search
+      - "100"
+      - --hnsw-seed
+      - "42"
+      - --neighbor-selection
+      - heuristic
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    restart: unless-stopped
