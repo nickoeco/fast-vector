@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-vector
+  labels:
+    app.kubernetes.io/name: fast-vector
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fast-vector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fast-vector
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fast-vector
+          image: fast-vector:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - --address
+            - 0.0.0.0:50051
+            - --index
+            - hnsw
+            - --dimension
+            - "384"
+            - --max-batch-size
+            - "1000"
+            - --kernel
+            - auto
+            - --m
+            - "16"
+            - --ef-construction
+            - "200"
+            - --ef-search
+            - "100"
+            - --hnsw-seed
+            - "42"
+            - --neighbor-selection
+            - heuristic
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          startupProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
