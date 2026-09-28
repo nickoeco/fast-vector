@@ -545,11 +545,25 @@ manifest would produce inconsistent query results. A production multi-replica de
 requires immutable snapshot loading or an external replication/coordinator design. The native
 gRPC probe requires Kubernetes 1.27 or newer.
 
+## Architecture and reproducibility
+
+- [`docs/architecture.md`](docs/architecture.md) explains ownership, module boundaries, data
+  flow, persistence, deployment, verification, and known limitations.
+- [`docs/reproducible-experiments.md`](docs/reproducible-experiments.md) provides an experiment
+  protocol and reporting checklist without pre-filled performance claims.
+- [`docs/project-showcase.md`](docs/project-showcase.md) contains an evidence-based resume
+  description, demonstration sequence, and interview questions.
+
+Version tags matching the CMake project version publish the runtime image to GitHub Container
+Registry. For example, after changing and committing `project(... VERSION 0.2.0)`, creating the
+tag `v0.2.0` triggers `.github/workflows/release.yml`. A mismatched tag fails before publishing.
+No release tag is created automatically.
+
 ## Roadmap
 
 Planned work adds transport security, index startup loading, production observability, and
-final reproducible experiment documentation. The exact `FlatIndex` remains the correctness
-and recall baseline for approximate indexes.
+multi-replica consistency. The exact `FlatIndex` remains the correctness and recall baseline
+for approximate indexes.
 
 ## License
 
