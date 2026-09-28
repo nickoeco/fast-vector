@@ -516,14 +516,40 @@ docker compose --project-name fast-vector down
 
 The health check verifies that the server accepts TCP connections on port 50051; it does not
 issue the standard gRPC health RPC. The image currently starts an empty in-memory index, uses
-insecure gRPC, and has no persistent volume. Container image publishing, Kubernetes probes,
-resource policies, and index snapshot loading are later deployment stages.
+insecure gRPC, and has no persistent volume. Container image publishing and index snapshot
+loading are later deployment stages.
+
+## Kubernetes deployment
+
+The manifests in `deploy/kubernetes` define a single-replica Deployment and an internal
+ClusterIP Service. Before applying them, build or publish the image and change
+`fast-vector:local` to an image reference available to the cluster. For a local cluster, load
+the locally built image using the command provided by that cluster implementation.
+
+```bash
+kubectl kustomize deploy/kubernetes
+kubectl apply -k deploy/kubernetes
+kubectl rollout status deployment/fast-vector
+kubectl port-forward service/fast-vector 50051:50051
+```
+
+Kubernetes uses the server's standard gRPC health service for startup, readiness, and liveness
+probes. The Pod runs as UID/GID `10001`, drops Linux capabilities, disables privilege
+escalation and service-account token mounting, uses a read-only root filesystem, and declares
+initial CPU and memory requests and limits. These resource values are safe starting points,
+not measured production sizing recommendations.
+
+The Deployment intentionally uses one replica with the `Recreate` strategy. Each process owns
+an independent in-memory index, and writes are not replicated between Pods, so scaling this
+manifest would produce inconsistent query results. A production multi-replica deployment
+requires immutable snapshot loading or an external replication/coordinator design. The native
+gRPC probe requires Kubernetes 1.27 or newer.
 
 ## Roadmap
 
-Planned work adds Kubernetes manifests, transport security, index startup loading,
-production observability, and final reproducible experiment documentation. The exact
-`FlatIndex` remains the correctness and recall baseline for approximate indexes.
+Planned work adds transport security, index startup loading, production observability, and
+final reproducible experiment documentation. The exact `FlatIndex` remains the correctness
+and recall baseline for approximate indexes.
 
 ## License
 
