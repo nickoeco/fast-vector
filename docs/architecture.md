@@ -69,8 +69,11 @@ Version 1 persistence supports complete `FlatIndex` snapshots. The format has fi
 little-endian fields, a magic value, version, dimensions, counts, flags, payload size, and an
 FNV-1a checksum. Loading validates all structural limits before allocating large buffers.
 
-Snapshot loading is not yet connected to the gRPC server lifecycle, and HNSW persistence is
-not implemented. Containers and Kubernetes therefore start with an empty index.
+The gRPC server can load a FlatIndex snapshot before opening its listening port and can reject
+all later writes in read-only mode. The snapshot dimension is authoritative. HNSW persistence,
+automatic saving, and online snapshot replacement are not implemented. The default container
+and Kubernetes commands still start with an empty index unless an operator mounts a snapshot
+and supplies the loading arguments.
 
 ## Deployment boundary
 
@@ -96,6 +99,7 @@ replication or consistency.
 - No HNSW persistence or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.
-- No multi-replica index consistency.
+- No multi-replica consistency for writable indexes; immutable read-only Flat snapshots can be
+  mounted consistently only when the platform supplies the same file to every Pod.
 - No crash-atomic snapshot replacement in format version 1.
 - Resource limits are starting values, not production sizing recommendations.

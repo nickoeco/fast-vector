@@ -206,13 +206,32 @@ Use `--index flat` for exact search; HNSW-only options are then ignored. The syn
 server lets gRPC schedule independent requests concurrently. `VectorStore` permits concurrent
 searches but serializes each insertion or batch against all other operations. RPC input errors
 map to `INVALID_ARGUMENT`, oversized configured batches to `RESOURCE_EXHAUSTED`, and expired
-deadlines to `DEADLINE_EXCEEDED`. Message size is bounded separately by
+deadlines to `DEADLINE_EXCEEDED`. Writes to a read-only store map to `FAILED_PRECONDITION`.
+Message size is bounded separately by
 `--max-message-bytes`. Batch insertion is not transactional when an ID already exists in the
 index, as described above.
 
+The server can load a version 1 FlatIndex snapshot before accepting requests. The loaded file
+defines the index dimension; `--dimension` is used only when constructing an empty index.
+Read-only mode rejects both insertion RPCs while retaining search and statistics:
+
+```bash
+./build-grpc/fast_vector_server \
+  --address 0.0.0.0:50051 \
+  --index flat \
+  --load-index /data/index.fv \
+  --read-only true \
+  --kernel auto
+```
+
+`--load-index` currently requires `--index flat`. A loaded index remains writable unless
+`--read-only true` is supplied. The server does not save later mutations automatically.
+`GetStats` reports the read-only state; snapshot vectors contribute to `vector_count` but not
+to the process-local `inserted_vectors` counter.
+
 The server enables gRPC's standard health-check service. Transport security, authentication,
-index loading, persistence during service operation, reflection, and production observability
-are outside this phase.
+HNSW loading, persistence during service operation, reflection, and production observability
+remain outside this phase.
 
 ### Python client and service load test
 
@@ -505,6 +524,19 @@ docker run --rm -p 50051:50051 fast-vector:local \
   --kernel auto
 ```
 
+Serve an existing FlatIndex snapshot without allowing divergent writes:
+
+```bash
+docker run --rm -p 50051:50051 \
+  --mount type=bind,source="$(pwd)/index.fv",target=/data/index.fv,readonly \
+  fast-vector:local \
+  --address 0.0.0.0:50051 \
+  --index flat \
+  --load-index /data/index.fv \
+  --read-only true \
+  --kernel auto
+```
+
 The image includes a TCP liveness check. Docker Compose also supplies the documented HNSW
 defaults, graceful SIGTERM shutdown, and restart policy:
 
@@ -515,9 +547,9 @@ docker compose --project-name fast-vector down
 ```
 
 The health check verifies that the server accepts TCP connections on port 50051; it does not
-issue the standard gRPC health RPC. The image currently starts an empty in-memory index, uses
-insecure gRPC, and has no persistent volume. Container image publishing and index snapshot
-loading are later deployment stages.
+issue the standard gRPC health RPC. The default image command starts an empty in-memory HNSW
+index and uses insecure gRPC. Snapshot files must be mounted explicitly and are never written
+by read-only mode.
 
 ## Kubernetes deployment
 
@@ -545,6 +577,12 @@ manifest would produce inconsistent query results. A production multi-replica de
 requires immutable snapshot loading or an external replication/coordinator design. The native
 gRPC probe requires Kubernetes 1.27 or newer.
 
+To serve a FlatIndex snapshot, mount it from storage as a read-only file and replace the
+container arguments with `--index flat --load-index /data/index.fv --read-only true` plus the
+address, batch-size, and kernel options. Storage provisioning is cluster-specific, so the base
+manifest does not assume a PersistentVolumeClaim or storage class. Replicas that mount the
+same immutable snapshot may answer consistent reads, but runtime insertion must remain disabled.
+
 ## Architecture and reproducibility
 
 - [`docs/architecture.md`](docs/architecture.md) explains ownership, module boundaries, data
@@ -561,7 +599,7 @@ No release tag is created automatically.
 
 ## Roadmap
 
-Planned work adds transport security, index startup loading, production observability, and
+Planned work adds transport security, HNSW persistence, production observability, and writable
 multi-replica consistency. The exact `FlatIndex` remains the correctness and recall baseline
 for approximate indexes.
 
