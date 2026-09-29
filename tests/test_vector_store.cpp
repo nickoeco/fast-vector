@@ -40,7 +40,28 @@ TEST(VectorStoreTest, AddsSearchesAndReportsStats) {
   EXPECT_EQ(stats.successful_queries, 1U);
   EXPECT_EQ(stats.failed_queries, 0U);
   EXPECT_EQ(stats.inserted_vectors, 3U);
+  EXPECT_FALSE(stats.read_only);
   EXPECT_EQ(store.maximum_batch_size(), 1'000U);
+  EXPECT_FALSE(store.read_only());
+}
+
+TEST(VectorStoreTest, ReadOnlyStoreRejectsWritesAndStillSearches) {
+  auto index = make_index();
+  index->add(10, std::vector<float>{1.0F, 0.0F});
+  fast_vector::VectorStore store(std::move(index), 10, true);
+
+  EXPECT_THROW(store.add(20, std::vector<float>{0.0F, 1.0F}), fast_vector::ReadOnlyStoreError);
+  EXPECT_THROW(store.add_batch(std::vector<fast_vector::VectorRecord>{{20, {0.0F, 1.0F}}}),
+               fast_vector::ReadOnlyStoreError);
+
+  const auto results = store.search(std::vector<float>{1.0F, 0.0F}, 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, 10U);
+  const fast_vector::StoreStats stats = store.stats();
+  EXPECT_EQ(stats.index_size, 1U);
+  EXPECT_EQ(stats.inserted_vectors, 0U);
+  EXPECT_TRUE(stats.read_only);
+  EXPECT_TRUE(store.read_only());
 }
 
 TEST(VectorStoreTest, CountsFailedQueriesAndZeroKAsSuccessful) {

@@ -6,6 +6,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "fast_vector/vector_index.h"
@@ -25,12 +26,20 @@ struct StoreStats {
   std::uint64_t successful_queries;
   std::uint64_t failed_queries;
   std::uint64_t inserted_vectors;
+  bool read_only;
+};
+
+/** Raised when a mutating operation targets a read-only store. */
+class ReadOnlyStoreError : public std::logic_error {
+ public:
+  ReadOnlyStoreError() : std::logic_error("vector store is read-only") {}
 };
 
 /** Thread-safe application layer around a single VectorIndex instance. */
 class VectorStore {
  public:
-  explicit VectorStore(std::unique_ptr<VectorIndex> index, std::size_t maximum_batch_size = 1'000);
+  explicit VectorStore(std::unique_ptr<VectorIndex> index, std::size_t maximum_batch_size = 1'000,
+                       bool read_only = false);
 
   void add(VectorId id, std::span<const float> vector);
 
@@ -44,12 +53,14 @@ class VectorStore {
 
   [[nodiscard]] StoreStats stats() const;
   [[nodiscard]] std::size_t maximum_batch_size() const noexcept;
+  [[nodiscard]] bool read_only() const noexcept;
 
  private:
   void validate_batch(std::span<const VectorRecord> vectors) const;
 
   std::unique_ptr<VectorIndex> index_;
   std::size_t maximum_batch_size_;
+  const bool read_only_;
   mutable std::shared_mutex mutex_;
   mutable std::atomic<std::uint64_t> successful_queries_{0};
   mutable std::atomic<std::uint64_t> failed_queries_{0};

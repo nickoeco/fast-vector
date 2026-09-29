@@ -108,6 +108,7 @@ class GrpcPythonClientTest(unittest.TestCase):
         self.assertEqual(stats.dimension, 3)
         self.assertEqual(stats.successful_queries, 1)
         self.assertEqual(stats.inserted_vectors, 3)
+        self.assertFalse(stats.read_only)
 
     def test_invalid_vector_surfaces_grpc_status(self) -> None:
         with self.assertRaises(grpc.RpcError) as context:

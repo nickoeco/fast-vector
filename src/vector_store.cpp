@@ -8,8 +8,9 @@
 
 namespace fast_vector {
 
-VectorStore::VectorStore(std::unique_ptr<VectorIndex> index, const std::size_t maximum_batch_size)
-    : index_(std::move(index)), maximum_batch_size_(maximum_batch_size) {
+VectorStore::VectorStore(std::unique_ptr<VectorIndex> index, const std::size_t maximum_batch_size,
+                         const bool read_only)
+    : index_(std::move(index)), maximum_batch_size_(maximum_batch_size), read_only_(read_only) {
   if (index_ == nullptr) {
     throw std::invalid_argument("vector store requires an index");
   }
@@ -19,12 +20,18 @@ VectorStore::VectorStore(std::unique_ptr<VectorIndex> index, const std::size_t m
 }
 
 void VectorStore::add(const VectorId id, const std::span<const float> vector) {
+  if (read_only_) {
+    throw ReadOnlyStoreError();
+  }
   std::unique_lock lock(mutex_);
   index_->add(id, vector);
   inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void VectorStore::add_batch(const std::span<const VectorRecord> vectors) {
+  if (read_only_) {
+    throw ReadOnlyStoreError();
+  }
   validate_batch(vectors);
   std::unique_lock lock(mutex_);
   for (const VectorRecord& vector : vectors) {
@@ -54,10 +61,13 @@ StoreStats VectorStore::stats() const {
       successful_queries_.load(std::memory_order_relaxed),
       failed_queries_.load(std::memory_order_relaxed),
       inserted_vectors_.load(std::memory_order_relaxed),
+      read_only_,
   };
 }
 
 std::size_t VectorStore::maximum_batch_size() const noexcept { return maximum_batch_size_; }
+
+bool VectorStore::read_only() const noexcept { return read_only_; }
 
 void VectorStore::validate_batch(const std::span<const VectorRecord> vectors) const {
   if (vectors.size() > maximum_batch_size_) {

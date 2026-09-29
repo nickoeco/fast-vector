@@ -85,6 +85,68 @@ TEST_F(GrpcServiceTest, AddsSearchesAndReturnsStatsOverLocalhost) {
   EXPECT_EQ(stats_response.successful_queries(), 1U);
   EXPECT_EQ(stats_response.failed_queries(), 0U);
   EXPECT_EQ(stats_response.inserted_vectors(), 1U);
+  EXPECT_FALSE(stats_response.read_only());
+}
+
+TEST(GrpcServiceStandaloneTest, MapsReadOnlyWritesToFailedPrecondition) {
+  auto index = std::make_unique<fast_vector::FlatIndex>(2);
+  index->add(42, std::vector<float>{1.0F, 0.0F});
+  auto store = std::make_shared<fast_vector::VectorStore>(std::move(index), 2, true);
+  fast_vector::service::VectorSearchService service(store, "flat");
+
+  grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  auto channel =
+      grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials());
+  auto stub = fast_vector::v1::VectorSearchService::NewStub(channel);
+  fast_vector::v1::AddVectorRequest request;
+  request.mutable_vector()->set_id(100);
+  request.mutable_vector()->add_values(0.0F);
+  request.mutable_vector()->add_values(1.0F);
+  fast_vector::v1::AddVectorResponse response;
+  grpc::ClientContext context;
+  const grpc::Status status = stub->AddVector(&context, request, &response);
+
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+
+  fast_vector::v1::BatchAddRequest batch_request;
+  auto* vector = batch_request.add_vectors();
+  vector->set_id(101);
+  vector->add_values(0.0F);
+  vector->add_values(1.0F);
+  fast_vector::v1::BatchAddResponse batch_response;
+  grpc::ClientContext batch_context;
+  const grpc::Status batch_status = stub->BatchAdd(&batch_context, batch_request, &batch_response);
+  EXPECT_EQ(batch_status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+
+  fast_vector::v1::SearchRequest search_request;
+  search_request.add_query(1.0F);
+  search_request.add_query(0.0F);
+  search_request.set_k(1);
+  fast_vector::v1::SearchResponse search_response;
+  grpc::ClientContext search_context;
+  const grpc::Status search_status =
+      stub->Search(&search_context, search_request, &search_response);
+  ASSERT_TRUE(search_status.ok()) << search_status.error_message();
+  ASSERT_EQ(search_response.neighbors_size(), 1);
+  EXPECT_EQ(search_response.neighbors(0).id(), 42U);
+
+  fast_vector::v1::GetStatsRequest stats_request;
+  fast_vector::v1::GetStatsResponse stats_response;
+  grpc::ClientContext stats_context;
+  const grpc::Status stats_status = stub->GetStats(&stats_context, stats_request, &stats_response);
+  ASSERT_TRUE(stats_status.ok()) << stats_status.error_message();
+  EXPECT_TRUE(stats_response.read_only());
+  EXPECT_EQ(stats_response.vector_count(), 1U);
+  EXPECT_EQ(stats_response.inserted_vectors(), 0U);
+  EXPECT_EQ(store->stats().index_size, 1U);
+  server->Shutdown();
+  server->Wait();
 }
 
 TEST_F(GrpcServiceTest, MapsInputAndResourceErrorsToGrpcStatuses) {

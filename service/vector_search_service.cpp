@@ -97,6 +97,7 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     response->set_successful_queries(stats.successful_queries);
     response->set_failed_queries(stats.failed_queries);
     response->set_inserted_vectors(stats.inserted_vectors);
+    response->set_read_only(stats.read_only);
     return grpc::Status::OK;
   } catch (const std::exception& error) {
     return exception_status(error);
@@ -111,6 +112,9 @@ grpc::Status VectorSearchService::cancelled_status(const grpc::ServerContext& co
 }
 
 grpc::Status VectorSearchService::exception_status(const std::exception& error) {
+  if (dynamic_cast<const ReadOnlyStoreError*>(&error) != nullptr) {
+    return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+  }
   if (dynamic_cast<const std::length_error*>(&error) != nullptr) {
     return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
   }
