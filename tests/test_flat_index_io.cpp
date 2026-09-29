@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "fast_vector/flat_index_io.h"
+#include "fast_vector/vector_store.h"
 
 namespace {
 
@@ -121,6 +123,25 @@ TEST(FlatIndexIoTest, RoundTripSupportsEmptyIndex) {
 
     EXPECT_EQ(restored.dimension(), 7U);
     EXPECT_EQ(restored.size(), 0U);
+}
+
+TEST(FlatIndexIoTest, LoadedSnapshotCanBackAReadOnlyStore) {
+    TemporaryIndexFile file;
+    const auto original = make_index();
+    const std::vector<float> query{0.5F, 1.0F, 2.0F};
+    const auto expected = original.search(query, 3);
+    fast_vector::save_flat_index(original, file.path());
+
+    auto loaded = std::make_unique<fast_vector::FlatIndex>(
+        fast_vector::load_flat_index(file.path(), fast_vector::DotProductKernel::Scalar));
+    fast_vector::VectorStore store(std::move(loaded), 100, true);
+
+    EXPECT_EQ(store.search(query, 3), expected);
+    EXPECT_EQ(store.stats().index_size, 3U);
+    EXPECT_EQ(store.stats().inserted_vectors, 0U);
+    EXPECT_TRUE(store.stats().read_only);
+    EXPECT_THROW(store.add(100, std::vector<float>{1.0F, 0.0F, 0.0F}),
+                 fast_vector::ReadOnlyStoreError);
 }
 
 TEST(FlatIndexIoTest, LoaderAppliesRequestedExecutionKernel) {

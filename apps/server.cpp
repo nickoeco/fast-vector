@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "fast_vector/flat_index.h"
+#include "fast_vector/flat_index_io.h"
 #include "fast_vector/hnsw_index.h"
 #include "fast_vector/vector_store.h"
 #include "service/vector_search_service.h"
@@ -38,7 +39,19 @@ struct ServerConfig {
   std::uint64_t hnsw_seed = 42;
   fast_vector::HnswNeighborSelection neighbor_selection =
       fast_vector::HnswNeighborSelection::Heuristic;
+  std::string load_index_path;
+  bool read_only = false;
 };
+
+bool parse_bool(const std::string_view value, const std::string& option) {
+  if (value == "true") {
+    return true;
+  }
+  if (value == "false") {
+    return false;
+  }
+  throw std::invalid_argument(option + " must be true or false");
+}
 
 std::uint64_t parse_unsigned(const std::string_view value, const std::string& option) {
   std::uint64_t parsed = 0;
@@ -108,6 +121,13 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
       } else {
         throw std::invalid_argument("--neighbor-selection must be simple or heuristic");
       }
+    } else if (option == "--load-index") {
+      config.load_index_path = value;
+      if (config.load_index_path.empty()) {
+        throw std::invalid_argument("--load-index must not be empty");
+      }
+    } else if (option == "--read-only") {
+      config.read_only = parse_bool(value, option);
     } else {
       throw std::invalid_argument("unknown server option: " + option);
     }
@@ -115,11 +135,18 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
   if (config.address.empty()) {
     throw std::invalid_argument("--address must not be empty");
   }
+  if (!config.load_index_path.empty() && config.index_type != "flat") {
+    throw std::invalid_argument("--load-index currently requires --index flat");
+  }
   return config;
 }
 
 std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config) {
   if (config.index_type == "flat") {
+    if (!config.load_index_path.empty()) {
+      return std::make_unique<fast_vector::FlatIndex>(
+          fast_vector::load_flat_index(config.load_index_path, config.kernel));
+    }
     return std::make_unique<fast_vector::FlatIndex>(config.dimension, config.kernel);
   }
   return std::make_unique<fast_vector::HnswIndex>(fast_vector::HnswConfig{
@@ -138,7 +165,8 @@ void print_usage() {
                "[--dimension D] [--max-batch-size N] [--max-message-bytes N] "
                "[--kernel scalar|auto|avx2] [--m M] [--ef-construction N] "
                "[--ef-search N] [--hnsw-seed S] "
-               "[--neighbor-selection simple|heuristic]\n";
+               "[--neighbor-selection simple|heuristic] [--load-index PATH] "
+               "[--read-only true|false]\n";
 }
 
 }  // namespace
@@ -146,8 +174,8 @@ void print_usage() {
 int main(const int argc, char* argv[]) {
   try {
     const ServerConfig config = parse_arguments(argc, argv);
-    auto store =
-        std::make_shared<fast_vector::VectorStore>(make_index(config), config.maximum_batch_size);
+    auto store = std::make_shared<fast_vector::VectorStore>(
+        make_index(config), config.maximum_batch_size, config.read_only);
     fast_vector::service::VectorSearchService vector_service(store, config.index_type);
 
     grpc::EnableDefaultHealthCheckService(true);
@@ -171,9 +199,11 @@ int main(const int argc, char* argv[]) {
       server->Shutdown();
     });
 
+    const fast_vector::StoreStats stats = store->stats();
     std::cout << "fast-vector gRPC server listening on " << config.address << " (selected port "
               << selected_port << ", index " << config.index_type << ", dimension "
-              << config.dimension << ")\n";
+              << stats.dimension << ", vectors " << stats.index_size << ", read-only "
+              << (stats.read_only ? "true" : "false") << ")\n";
     server->Wait();
     shutdown_monitor.join();
   } catch (const std::exception& error) {
