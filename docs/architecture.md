@@ -60,8 +60,10 @@ named Sentence Transformers model, and writes three artifacts:
   names.
 
 The offline `fast_vector_build_index` tool streams `vectors.jsonl`, delegates vector validation
-and normalization to `FlatIndex`, writes a temporary snapshot, and reloads it before publishing
-the new file. This creates the immutable artifact consumed by read-only service deployments
+and normalization to `FlatIndex`, writes a same-directory temporary snapshot, and reloads it
+before publication. On Linux, publication flushes the file, uses an atomic filesystem operation
+that either refuses an existing target or explicitly replaces it, and flushes the parent
+directory. This creates the immutable artifact consumed by read-only service deployments
 without teaching the C++ search core about documents or chunk metadata.
 
 The semantic-search client verifies the manifest and both data files before ingestion. Query
@@ -106,5 +108,6 @@ replication or consistency.
 - No TLS, authentication, authorization, or rate limiting.
 - No multi-replica consistency for writable indexes; immutable read-only Flat snapshots can be
   mounted consistently only when the platform supplies the same file to every Pod.
-- No crash-atomic snapshot replacement in format version 1.
+- Direct calls to the low-level snapshot save API do not provide atomic replacement; the
+  offline builder provides the durable Linux publication workflow.
 - Resource limits are starting values, not production sizing recommendations.

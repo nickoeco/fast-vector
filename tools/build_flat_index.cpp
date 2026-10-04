@@ -1,7 +1,10 @@
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -11,6 +14,11 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "fast_vector/flat_index.h"
 #include "fast_vector/flat_index_io.h"
@@ -23,6 +31,7 @@ struct BuildOptions {
   std::filesystem::path output_path;
   std::size_t dimension = 0;
   std::optional<std::size_t> expected_count;
+  bool overwrite = false;
 };
 
 std::size_t parse_size(const std::string_view value, const std::string& option,
@@ -34,6 +43,16 @@ std::size_t parse_size(const std::string_view value, const std::string& option,
     throw std::invalid_argument("invalid value for " + option);
   }
   return static_cast<std::size_t>(parsed);
+}
+
+bool parse_bool(const std::string_view value, const std::string& option) {
+  if (value == "true") {
+    return true;
+  }
+  if (value == "false") {
+    return false;
+  }
+  throw std::invalid_argument("invalid value for " + option + ": expected true or false");
 }
 
 BuildOptions parse_arguments(const int argc, char* argv[]) {
@@ -55,6 +74,8 @@ BuildOptions parse_arguments(const int argc, char* argv[]) {
       options.dimension = parse_size(value, option, false);
     } else if (option == "--expected-count") {
       options.expected_count = parse_size(value, option, true);
+    } else if (option == "--overwrite") {
+      options.overwrite = parse_bool(value, option);
     } else {
       throw std::invalid_argument("unknown option: " + option);
     }
@@ -67,8 +88,91 @@ BuildOptions parse_arguments(const int argc, char* argv[]) {
 
 void print_usage() {
   std::cerr << "Usage: fast_vector_build_index --input vectors.jsonl --output index.fv "
-               "--dimension D [--expected-count N]\n";
+               "--dimension D [--expected-count N] [--overwrite true|false]\n";
 }
+
+#if defined(__linux__)
+class FileDescriptor {
+ public:
+  explicit FileDescriptor(const int descriptor) : descriptor_(descriptor) {}
+  ~FileDescriptor() {
+    if (descriptor_ >= 0) {
+      ::close(descriptor_);
+    }
+  }
+
+  FileDescriptor(const FileDescriptor&) = delete;
+  FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+  [[nodiscard]] int get() const noexcept { return descriptor_; }
+
+ private:
+  int descriptor_;
+};
+
+[[noreturn]] void throw_system_error(const std::string& action, const std::filesystem::path& path) {
+  const int error = errno;
+  throw std::runtime_error(action + ": " + path.string() + ": " + std::strerror(error));
+}
+
+void sync_file(const std::filesystem::path& path) {
+  const FileDescriptor descriptor(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+  if (descriptor.get() < 0) {
+    throw_system_error("failed to open snapshot for fsync", path);
+  }
+  if (::fsync(descriptor.get()) != 0) {
+    throw_system_error("failed to fsync snapshot", path);
+  }
+}
+
+void sync_parent_directory(const std::filesystem::path& path) {
+  std::filesystem::path parent = path.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+  const FileDescriptor descriptor(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  if (descriptor.get() < 0) {
+    throw_system_error("failed to open output directory for fsync", parent);
+  }
+  if (::fsync(descriptor.get()) != 0) {
+    throw_system_error("failed to fsync output directory", parent);
+  }
+}
+
+void publish_snapshot(const std::filesystem::path& temporary, const std::filesystem::path& output,
+                      const bool overwrite) {
+  sync_file(temporary);
+  if (overwrite) {
+    if (::rename(temporary.c_str(), output.c_str()) != 0) {
+      throw_system_error("failed to atomically replace output", output);
+    }
+  } else {
+    if (::link(temporary.c_str(), output.c_str()) != 0) {
+      if (errno == EEXIST) {
+        throw std::runtime_error("output already exists: " + output.string());
+      }
+      throw_system_error("failed to atomically publish output", output);
+    }
+    std::error_code remove_error;
+    if (!std::filesystem::remove(temporary, remove_error)) {
+      throw std::runtime_error("failed to remove published temporary file: " +
+                               remove_error.message());
+    }
+  }
+  sync_parent_directory(output);
+}
+#else
+void publish_snapshot(const std::filesystem::path& temporary, const std::filesystem::path& output,
+                      const bool overwrite) {
+  if (overwrite) {
+    throw std::runtime_error("--overwrite true is supported only on Linux");
+  }
+  if (std::filesystem::exists(output)) {
+    throw std::runtime_error("output already exists: " + output.string());
+  }
+  std::filesystem::rename(temporary, output);
+}
+#endif
 
 class TemporaryOutput {
  public:
@@ -103,7 +207,7 @@ void build_index(const BuildOptions& options) {
   if (!std::filesystem::is_regular_file(options.input_path)) {
     throw std::runtime_error("input is not a regular file: " + options.input_path.string());
   }
-  if (std::filesystem::exists(options.output_path)) {
+  if (!options.overwrite && std::filesystem::exists(options.output_path)) {
     throw std::runtime_error("output already exists: " + options.output_path.string());
   }
 
@@ -143,7 +247,7 @@ void build_index(const BuildOptions& options) {
     throw std::runtime_error("written snapshot failed structural verification");
   }
   const std::uintmax_t file_size = std::filesystem::file_size(temporary.path());
-  std::filesystem::rename(temporary.path(), options.output_path);
+  publish_snapshot(temporary.path(), options.output_path, options.overwrite);
   temporary.commit();
 
   const auto elapsed =

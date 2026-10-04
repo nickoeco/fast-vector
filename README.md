@@ -510,8 +510,9 @@ The loader rejects unknown versions or flags, invalid dimensions and sizes, trun
 trailing data, checksum mismatches, duplicate IDs, non-finite components, and vectors that
 are not L2-normalized. The checksum detects accidental corruption; FNV-1a is not a
 cryptographic authenticity mechanism. The format does not serialize C++ container objects
-or pointers, and loading rebuilds the duplicate-ID set. Snapshot writes are not crash-atomic
-in version 1, so callers should write to a new path before replacing an important snapshot.
+or pointers, and loading rebuilds the duplicate-ID set. The low-level `save_flat_index()` API
+writes exactly the requested path and does not provide crash-atomic replacement. Use the offline
+builder when publishing or replacing a deployable snapshot.
 
 ### Offline FlatIndex builder
 
@@ -532,10 +533,28 @@ names, invalid JSON numbers, IDs outside `uint64`, dimension mismatches, duplica
 non-finite values, and zero vectors are rejected with a line number. The dimension and expected
 count should come from the embedding manifest.
 
-The builder uses `FlatIndex::add()` for validation and normalization, writes a uniquely named
-temporary file beside the requested output, reloads it with the production loader, and renames
-it only after structural verification. It intentionally refuses to overwrite an existing
-output. Fully crash-safe replacement of an existing snapshot remains Phase 9A work.
+The builder uses `FlatIndex::add()` for validation and normalization and writes a uniquely named
+temporary file beside the requested output. It reloads that file with the production loader
+before publishing it. By default, publication fails if the output already exists, including
+when another builder wins a concurrent publication race.
+
+On Linux, explicitly replace an existing snapshot with `--overwrite true`:
+
+```bash
+./build-release/fast_vector_build_index \
+  --input embedding-output/vectors.jsonl \
+  --output embedding-output/index.fv \
+  --dimension 384 \
+  --expected-count 10000 \
+  --overwrite true
+```
+
+The Linux publication path flushes the verified temporary file with `fsync()`, atomically
+renames it over the previous snapshot, and then `fsync()`s the parent directory. A crash before
+the rename leaves the previous snapshot intact; after the rename, readers opening the path see
+the complete new snapshot. Existing open file descriptors may continue reading the old inode.
+These guarantees require a local filesystem that correctly implements atomic rename and
+`fsync()` durability. `--overwrite true` is rejected on non-Linux platforms.
 
 Successful output reports vector count, dimension, file size, and total build time. The timing
 includes JSONL parsing, index construction, snapshot writing, and verification; it is not a
