@@ -507,6 +507,34 @@ cryptographic authenticity mechanism. The format does not serialize C++ containe
 or pointers, and loading rebuilds the duplicate-ID set. Snapshot writes are not crash-atomic
 in version 1, so callers should write to a new path before replacing an important snapshot.
 
+### Offline FlatIndex builder
+
+`fast_vector_build_index` converts the embedding pipeline's `vectors.jsonl` into a deployable
+FlatIndex snapshot without loading the whole JSONL file into a second in-memory collection:
+
+```bash
+./build-release/fast_vector_build_index \
+  --input embedding-output/vectors.jsonl \
+  --output embedding-output/index.fv \
+  --dimension 384 \
+  --expected-count 10000
+```
+
+The input is one strict JSON object per non-empty line with exactly `id` and `values` members.
+Member order and JSON whitespace may vary, but unknown or duplicate members, escaped member
+names, invalid JSON numbers, IDs outside `uint64`, dimension mismatches, duplicate IDs,
+non-finite values, and zero vectors are rejected with a line number. The dimension and expected
+count should come from the embedding manifest.
+
+The builder uses `FlatIndex::add()` for validation and normalization, writes a uniquely named
+temporary file beside the requested output, reloads it with the production loader, and renames
+it only after structural verification. It intentionally refuses to overwrite an existing
+output. Fully crash-safe replacement of an existing snapshot remains Phase 9A work.
+
+Successful output reports vector count, dimension, file size, and total build time. The timing
+includes JSONL parsing, index construction, snapshot writing, and verification; it is not a
+query-performance benchmark.
+
 ## Container deployment
 
 The multi-stage Docker build compiles the optional gRPC server on Ubuntu 22.04 and copies only

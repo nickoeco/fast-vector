@@ -59,6 +59,11 @@ named Sentence Transformers model, and writes three artifacts:
 - `manifest.json`: schema, model identity, dimension, normalization policy, counts, and file
   names.
 
+The offline `fast_vector_build_index` tool streams `vectors.jsonl`, delegates vector validation
+and normalization to `FlatIndex`, writes a temporary snapshot, and reloads it before publishing
+the new file. This creates the immutable artifact consumed by read-only service deployments
+without teaching the C++ search core about documents or chunk metadata.
+
 The semantic-search client verifies the manifest and both data files before ingestion. Query
 text is embedded with the manifest model, sent to the service, and result IDs are mapped back
 to chunks. The output is retrieval evidence, not an LLM-generated answer.

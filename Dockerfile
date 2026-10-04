@@ -22,6 +22,7 @@ COPY include ./include
 COPY proto ./proto
 COPY service ./service
 COPY src ./src
+COPY tools ./tools
 
 RUN cmake -S . -B /build \
         -DCMAKE_BUILD_TYPE=Release \
