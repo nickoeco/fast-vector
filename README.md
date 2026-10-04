@@ -221,6 +221,7 @@ Read-only mode rejects both insertion RPCs while retaining search and statistics
   --index flat \
   --load-index /data/index.fv \
   --read-only true \
+  --reload-on-sighup true \
   --kernel auto
 ```
 
@@ -229,6 +230,22 @@ Read-only mode rejects both insertion RPCs while retaining search and statistics
 `GetStats` reports the read-only state; snapshot vectors contribute to `vector_count` but not
 to the process-local `inserted_vectors` counter.
 
+On Linux, `--reload-on-sighup true` enables zero-downtime snapshot replacement for this
+read-only configuration. Publish a verified replacement to the same `--load-index` path with
+`fast_vector_build_index --overwrite true`, then signal the server:
+
+```bash
+kill -HUP <server-pid>
+```
+
+The server loads and validates the file before taking the store's exclusive lock, so disk I/O
+does not block searches. The lock only protects the final index-pointer swap: searches already
+holding the shared lock finish on the old index, and later searches use the new index. Query
+counters survive the reload; snapshot vectors still do not count as process-local insertions.
+If loading fails, the server logs the error, keeps serving the previous in-memory index, and
+remains healthy. Multiple SIGHUP notifications may coalesce into one reload. Hot reload is not
+available for writable stores, empty indexes, HNSW, or non-Linux platforms.
+
 The server enables gRPC's standard health-check service. Transport security, authentication,
 HNSW loading, persistence during service operation, reflection, and production observability
 remain outside this phase.
@@ -236,7 +253,9 @@ remain outside this phase.
 The Python integration suite also exercises the complete snapshot-serving path: it builds a
 FlatIndex snapshot from `tests/data/vectors.jsonl`, starts a server on a dynamic local port,
 checks the standard gRPC health RPC, verifies deterministic search and statistics, and confirms
-that both single and batch writes fail with `FAILED_PRECONDITION` in read-only mode. Set
+that both single and batch writes fail with `FAILED_PRECONDITION` in read-only mode. It then
+atomically replaces the snapshot, signals a live reload, and verifies that a corrupt subsequent
+snapshot cannot replace the valid in-memory index. Set
 `FAST_VECTOR_SERVER` and `FAST_VECTOR_BUILDER` when the executables are outside `build-grpc`.
 
 ### Python client and service load test

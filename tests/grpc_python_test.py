@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import select
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -141,6 +144,9 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
         temporary_path = Path(cls._temporary_directory.name)
         generated_directory = temporary_path / "generated"
         snapshot_path = temporary_path / "index.fv"
+        cls._builder_path = builder_path
+        cls._snapshot_path = snapshot_path
+        cls._temporary_path = temporary_path
         generate(REPOSITORY_ROOT / "proto", generated_directory)
 
         build_result = subprocess.run(
@@ -178,6 +184,8 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
                 "--load-index",
                 str(snapshot_path),
                 "--read-only",
+                "true",
+                "--reload-on-sighup",
                 "true",
                 "--max-batch-size",
                 "10",
@@ -238,6 +246,57 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
         final_stats = self._client.stats()
         self.assertEqual(final_stats.vector_count, 3)
         self.assertEqual(final_stats.inserted_vectors, 0)
+
+        replacement_input = self._temporary_path / "replacement.jsonl"
+        replacement_input.write_text(
+            '{"id": 999, "values": [0.0, 0.0, 1.0]}\n', encoding="utf-8"
+        )
+        replacement = subprocess.run(
+            [
+                str(self._builder_path),
+                "--input",
+                str(replacement_input),
+                "--output",
+                str(self._snapshot_path),
+                "--dimension",
+                "3",
+                "--expected-count",
+                "1",
+                "--overwrite",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(replacement.returncode, 0, replacement.stderr)
+        os.kill(self._server.pid, signal.SIGHUP)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            reloaded = self._client.search([0.0, 0.0, 1.0], 1)
+            if reloaded.neighbors and reloaded.neighbors[0].id == 999:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("server did not expose the replacement snapshot before the timeout")
+
+        reloaded_stats = self._client.stats()
+        self.assertEqual(reloaded_stats.vector_count, 1)
+        self.assertEqual(reloaded_stats.dimension, 3)
+        self.assertTrue(reloaded_stats.read_only)
+        self.assertEqual(reloaded_stats.inserted_vectors, 0)
+
+        self._snapshot_path.write_bytes(b"corrupt snapshot")
+        os.kill(self._server.pid, signal.SIGHUP)
+        readable, _, _ = select.select([self._server.stderr], [], [], 5.0)
+        self.assertTrue(readable, "server did not report the failed reload before the timeout")
+        reload_error = self._server.stderr.readline()
+        self.assertIn("Snapshot reload failed", reload_error)
+
+        preserved = self._client.search([0.0, 0.0, 1.0], 1)
+        self.assertEqual([neighbor.id for neighbor in preserved.neighbors], [999])
+        self.assertEqual(self._client.stats().vector_count, 1)
 
 
 if __name__ == "__main__":

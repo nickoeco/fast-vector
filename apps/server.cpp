@@ -23,8 +23,10 @@
 namespace {
 
 volatile std::sig_atomic_t stop_requested = 0;
+volatile std::sig_atomic_t reload_requested = 0;
 
-void handle_signal(int) { stop_requested = 1; }
+void handle_stop_signal(int) { stop_requested = 1; }
+void handle_reload_signal(int) { reload_requested = 1; }
 
 struct ServerConfig {
   std::string address = "0.0.0.0:50051";
@@ -41,6 +43,7 @@ struct ServerConfig {
       fast_vector::HnswNeighborSelection::Heuristic;
   std::string load_index_path;
   bool read_only = false;
+  bool reload_on_sighup = false;
 };
 
 bool parse_bool(const std::string_view value, const std::string& option) {
@@ -128,6 +131,8 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
       }
     } else if (option == "--read-only") {
       config.read_only = parse_bool(value, option);
+    } else if (option == "--reload-on-sighup") {
+      config.reload_on_sighup = parse_bool(value, option);
     } else {
       throw std::invalid_argument("unknown server option: " + option);
     }
@@ -138,6 +143,16 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
   if (!config.load_index_path.empty() && config.index_type != "flat") {
     throw std::invalid_argument("--load-index currently requires --index flat");
   }
+  if (config.reload_on_sighup &&
+      (config.index_type != "flat" || config.load_index_path.empty() || !config.read_only)) {
+    throw std::invalid_argument(
+        "--reload-on-sighup true requires a read-only FlatIndex loaded from a snapshot");
+  }
+#if !defined(SIGHUP)
+  if (config.reload_on_sighup) {
+    throw std::invalid_argument("--reload-on-sighup is not supported on this platform");
+  }
+#endif
   return config;
 }
 
@@ -166,7 +181,7 @@ void print_usage() {
                "[--kernel scalar|auto|avx2] [--m M] [--ef-construction N] "
                "[--ef-search N] [--hnsw-seed S] "
                "[--neighbor-selection simple|heuristic] [--load-index PATH] "
-               "[--read-only true|false]\n";
+               "[--read-only true|false] [--reload-on-sighup true|false]\n";
 }
 
 }  // namespace
@@ -190,10 +205,32 @@ int main(const int argc, char* argv[]) {
       throw std::runtime_error("failed to start gRPC server on " + config.address);
     }
 
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-    std::thread shutdown_monitor([&server] {
+    std::signal(SIGINT, handle_stop_signal);
+    std::signal(SIGTERM, handle_stop_signal);
+#if defined(SIGHUP)
+    if (config.reload_on_sighup) {
+      std::signal(SIGHUP, handle_reload_signal);
+    }
+#endif
+    std::thread shutdown_monitor([&config, &server, &store] {
       while (stop_requested == 0) {
+#if defined(SIGHUP)
+        if (reload_requested != 0) {
+          reload_requested = 0;
+          try {
+            auto replacement = std::make_unique<fast_vector::FlatIndex>(
+                fast_vector::load_flat_index(config.load_index_path, config.kernel));
+            const std::size_t count = replacement->size();
+            const std::size_t dimension = replacement->dimension();
+            store->replace_index(std::move(replacement));
+            std::cout << "Reloaded FlatIndex snapshot from " << config.load_index_path
+                      << " (dimension " << dimension << ", vectors " << count << ")\n";
+          } catch (const std::exception& error) {
+            std::cerr << "Snapshot reload failed; continuing with the current index: "
+                      << error.what() << '\n';
+          }
+        }
+#endif
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
       server->Shutdown();

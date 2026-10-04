@@ -77,10 +77,12 @@ little-endian fields, a magic value, version, dimensions, counts, flags, payload
 FNV-1a checksum. Loading validates all structural limits before allocating large buffers.
 
 The gRPC server can load a FlatIndex snapshot before opening its listening port and can reject
-all later writes in read-only mode. The snapshot dimension is authoritative. HNSW persistence,
-automatic saving, and online snapshot replacement are not implemented. The default container
-and Kubernetes commands still start with an empty index unless an operator mounts a snapshot
-and supplies the loading arguments.
+all later writes in read-only mode. The snapshot dimension is authoritative. On Linux, an
+explicit SIGHUP mode loads and validates a replacement outside the store lock, then swaps index
+ownership under an exclusive lock. Failed reloads preserve the current in-memory index. HNSW
+persistence and automatic saving are not implemented. The default container and Kubernetes
+commands still start with an empty index unless an operator mounts a snapshot and supplies the
+loading arguments.
 
 ## Deployment boundary
 
