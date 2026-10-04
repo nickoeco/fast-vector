@@ -233,6 +233,12 @@ The server enables gRPC's standard health-check service. Transport security, aut
 HNSW loading, persistence during service operation, reflection, and production observability
 remain outside this phase.
 
+The Python integration suite also exercises the complete snapshot-serving path: it builds a
+FlatIndex snapshot from `tests/data/vectors.jsonl`, starts a server on a dynamic local port,
+checks the standard gRPC health RPC, verifies deterministic search and statistics, and confirms
+that both single and batch writes fail with `FAILED_PRECONDITION` in read-only mode. Set
+`FAST_VECTOR_SERVER` and `FAST_VECTOR_BUILDER` when the executables are outside `build-grpc`.
+
 ### Python client and service load test
 
 Keep the Python gRPC toolchain isolated and generate the client modules from the checked-in
