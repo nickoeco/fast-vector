@@ -64,6 +64,31 @@ TEST(VectorStoreTest, ReadOnlyStoreRejectsWritesAndStillSearches) {
   EXPECT_TRUE(store.read_only());
 }
 
+TEST(VectorStoreTest, ReadOnlyStoreAtomicallyReplacesItsIndex) {
+  auto original = make_index();
+  original->add(10, std::vector<float>{1.0F, 0.0F});
+  fast_vector::VectorStore store(std::move(original), 10, true);
+
+  auto replacement = make_index(3);
+  replacement->add(20, std::vector<float>{0.0F, 0.0F, 1.0F});
+  store.replace_index(std::move(replacement));
+
+  const auto results = store.search(std::vector<float>{0.0F, 0.0F, 1.0F}, 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, 20U);
+  EXPECT_EQ(store.stats().dimension, 3U);
+  EXPECT_EQ(store.stats().inserted_vectors, 0U);
+}
+
+TEST(VectorStoreTest, RejectsInvalidIndexReplacement) {
+  fast_vector::VectorStore writable(make_index());
+  EXPECT_THROW(writable.replace_index(make_index()), std::logic_error);
+
+  fast_vector::VectorStore read_only(make_index(), 10, true);
+  EXPECT_THROW(read_only.replace_index(nullptr), std::invalid_argument);
+  EXPECT_EQ(read_only.stats().dimension, 2U);
+}
+
 TEST(VectorStoreTest, CountsFailedQueriesAndZeroKAsSuccessful) {
   fast_vector::VectorStore store(make_index());
   store.add(1, std::vector<float>{1.0F, 0.0F});

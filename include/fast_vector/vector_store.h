@@ -49,6 +49,9 @@ class VectorStore {
    */
   void add_batch(std::span<const VectorRecord> vectors);
 
+  /** Atomically replace the index owned by a read-only store. */
+  void replace_index(std::unique_ptr<VectorIndex> index);
+
   [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k) const;
 
   [[nodiscard]] StoreStats stats() const;

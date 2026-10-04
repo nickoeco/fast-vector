@@ -40,6 +40,19 @@ void VectorStore::add_batch(const std::span<const VectorRecord> vectors) {
   }
 }
 
+void VectorStore::replace_index(std::unique_ptr<VectorIndex> index) {
+  if (!read_only_) {
+    throw std::logic_error("index replacement requires a read-only vector store");
+  }
+  if (index == nullptr) {
+    throw std::invalid_argument("replacement index must not be null");
+  }
+  {
+    std::unique_lock lock(mutex_);
+    index_.swap(index);
+  }
+}
+
 std::vector<SearchResult> VectorStore::search(const std::span<const float> query,
                                               const std::size_t k) const {
   try {
