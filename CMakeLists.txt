@@ -86,6 +86,15 @@ target_link_libraries(fast_vector_demo PRIVATE fast_vector::fast_vector)
 fast_vector_set_warnings(fast_vector_demo)
 fast_vector_enable_sanitizers(fast_vector_demo)
 
+add_executable(fast_vector_build_index
+    tools/build_flat_index.cpp
+    tools/vector_jsonl.cpp
+)
+target_include_directories(fast_vector_build_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fast_vector_build_index PRIVATE fast_vector::fast_vector)
+fast_vector_set_warnings(fast_vector_build_index)
+fast_vector_enable_sanitizers(fast_vector_build_index)
+
 if(FAST_VECTOR_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(
@@ -102,14 +111,25 @@ if(FAST_VECTOR_BUILD_TESTS)
         tests/test_flat_index.cpp
         tests/test_flat_index_io.cpp
         tests/test_hnsw_index.cpp
+        tests/test_vector_jsonl.cpp
         tests/test_vector_store.cpp
+        tools/vector_jsonl.cpp
     )
+    target_include_directories(fast_vector_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fast_vector_tests PRIVATE fast_vector::fast_vector GTest::gtest_main)
     fast_vector_set_warnings(fast_vector_tests)
     fast_vector_enable_sanitizers(fast_vector_tests)
 
     include(GoogleTest)
     gtest_discover_tests(fast_vector_tests)
+    add_test(
+        NAME BuildIndexCliTest
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:fast_vector_build_index>
+            -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/tests/data/vectors.jsonl
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/build-index-test.fv
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_build_index.cmake
+    )
 endif()
 
 if(FAST_VECTOR_BUILD_BENCHMARKS)
