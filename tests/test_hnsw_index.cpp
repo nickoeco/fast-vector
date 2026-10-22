@@ -36,6 +36,10 @@ TEST(HnswIndexTest, RejectsInvalidConfiguration) {
   config = test_config();
   config.ef_search = 0;
   EXPECT_THROW((void)fast_vector::HnswIndex{config}, std::invalid_argument);
+
+  config = test_config();
+  config.neighbor_selection = static_cast<fast_vector::HnswNeighborSelection>(99);
+  EXPECT_THROW((void)fast_vector::HnswIndex{config}, std::invalid_argument);
 }
 
 TEST(HnswIndexTest, AddsAndFindsOneVector) {

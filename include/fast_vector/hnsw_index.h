@@ -12,6 +12,8 @@
 
 namespace fast_vector {
 
+class HnswIndexSerializer;
+
 /** Strategy used to choose graph neighbors from a similarity-ranked candidate list. */
 enum class HnswNeighborSelection {
   Simple,
@@ -57,6 +59,7 @@ class HnswIndex final : public VectorIndex {
   [[nodiscard]] HnswStats stats() const noexcept;
 
  private:
+  friend class HnswIndexSerializer;
   using NodeIndex = std::uint32_t;
   using RawDotProduct = float (*)(const float*, const float*, std::size_t);
 

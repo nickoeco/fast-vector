@@ -30,6 +30,10 @@ HnswConfig validate_config(HnswConfig config) {
   if (config.ef_search == 0) {
     throw std::invalid_argument("HNSW ef_search must be greater than zero");
   }
+  if (config.neighbor_selection != HnswNeighborSelection::Simple &&
+      config.neighbor_selection != HnswNeighborSelection::Heuristic) {
+    throw std::invalid_argument("HNSW neighbor selection strategy is invalid");
+  }
   return config;
 }
 
