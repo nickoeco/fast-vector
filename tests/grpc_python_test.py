@@ -299,5 +299,161 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
         self.assertEqual(self._client.stats().vector_count, 1)
 
 
+class HnswSnapshotServerIntegrationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._server_path = Path(
+            os.environ.get("FAST_VECTOR_SERVER", REPOSITORY_ROOT / "build-grpc" / "fast_vector_server")
+        )
+        fixture_path = Path(
+            os.environ.get(
+                "FAST_VECTOR_HNSW_FIXTURE",
+                REPOSITORY_ROOT / "build-grpc" / "fast_vector_hnsw_snapshot_fixture",
+            )
+        )
+        if not cls._server_path.is_file() or not fixture_path.is_file():
+            raise unittest.SkipTest("gRPC server or HNSW snapshot fixture executable not found")
+
+        cls._temporary_directory = tempfile.TemporaryDirectory()
+        temporary_path = Path(cls._temporary_directory.name)
+        cls._snapshot_path = temporary_path / "index.fvh"
+        cls._generated_directory = temporary_path / "generated"
+        generate(REPOSITORY_ROOT / "proto", cls._generated_directory)
+        fixture = subprocess.run(
+            [str(fixture_path), str(cls._snapshot_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if fixture.returncode != 0:
+            cls._temporary_directory.cleanup()
+            raise RuntimeError(f"HNSW fixture failed: {fixture.stderr}")
+
+        cls._address = f"127.0.0.1:{reserve_local_port()}"
+        cls._server = subprocess.Popen(
+            [
+                str(cls._server_path),
+                "--address",
+                cls._address,
+                "--index",
+                "hnsw",
+                "--load-index",
+                str(cls._snapshot_path),
+                "--dimension",
+                "99",
+                "--m",
+                "99",
+                "--read-only",
+                "true",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            cls._client = VectorSearchClient(
+                cls._address, cls._generated_directory, timeout_seconds=5.0
+            )
+        except (grpc.RpcError, grpc.FutureTimeoutError):
+            stdout, stderr = stop_server(cls._server)
+            cls._temporary_directory.cleanup()
+            raise RuntimeError(f"HNSW server did not become ready\nstdout: {stdout}\nstderr: {stderr}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if hasattr(cls, "_client"):
+            cls._client.close()
+        if hasattr(cls, "_server"):
+            stop_server(cls._server)
+        if hasattr(cls, "_temporary_directory"):
+            cls._temporary_directory.cleanup()
+
+    def test_loaded_snapshot_serves_search_stats_and_rejects_writes(self) -> None:
+        with grpc.insecure_channel(self._address) as channel:
+            health = health_pb2_grpc.HealthStub(channel)
+            response = health.Check(health_pb2.HealthCheckRequest(service=""), timeout=5.0)
+            self.assertEqual(response.status, health_pb2.HealthCheckResponse.SERVING)
+
+        result = self._client.search([1.0, 0.0, 0.0], 3)
+        self.assertEqual([neighbor.id for neighbor in result.neighbors], [101, 102, 103])
+        stats = self._client.stats()
+        self.assertEqual(stats.index_type, "hnsw")
+        self.assertEqual(stats.vector_count, 3)
+        self.assertEqual(stats.dimension, 3)
+        self.assertTrue(stats.read_only)
+        self.assertEqual(stats.inserted_vectors, 0)
+        with self.assertRaises(grpc.RpcError) as context:
+            self._client.add(104, [0.0, 0.0, 1.0])
+        self.assertEqual(context.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+
+    def test_corrupt_snapshot_fails_before_listening(self) -> None:
+        corrupt_path = Path(self._temporary_directory.name) / "corrupt.fvh"
+        corrupt_path.write_bytes(b"corrupt snapshot")
+        result = subprocess.run(
+            [
+                str(self._server_path),
+                "--address",
+                f"127.0.0.1:{reserve_local_port()}",
+                "--index",
+                "hnsw",
+                "--load-index",
+                str(corrupt_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid HNSW index", result.stderr)
+
+    def test_hnsw_sighup_reload_remains_unsupported(self) -> None:
+        result = subprocess.run(
+            [
+                str(self._server_path),
+                "--index",
+                "hnsw",
+                "--load-index",
+                str(self._snapshot_path),
+                "--read-only",
+                "true",
+                "--reload-on-sighup",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("read-only FlatIndex", result.stderr)
+
+    def test_loaded_snapshot_can_accept_runtime_writes(self) -> None:
+        address = f"127.0.0.1:{reserve_local_port()}"
+        server = subprocess.Popen(
+            [
+                str(self._server_path),
+                "--address",
+                address,
+                "--index",
+                "hnsw",
+                "--load-index",
+                str(self._snapshot_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            with VectorSearchClient(address, self._generated_directory, timeout_seconds=5.0) as client:
+                self.assertEqual(client.add(104, [0.0, 0.0, 1.0]).index_size, 4)
+                self.assertEqual(client.search([0.0, 0.0, 1.0], 1).neighbors[0].id, 104)
+                stats = client.stats()
+                self.assertFalse(stats.read_only)
+                self.assertEqual(stats.inserted_vectors, 1)
+        finally:
+            stop_server(server)
+
+
 if __name__ == "__main__":
     unittest.main()

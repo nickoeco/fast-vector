@@ -72,21 +72,23 @@ to chunks. The output is retrieval evidence, not an LLM-generated answer.
 
 ## Persistence
 
-Version 1 persistence supports complete `FlatIndex` and `HnswIndex` snapshots with distinct
-magic values. Both formats use fixed-width little-endian fields and an FNV-1a checksum. The
-HNSW format preserves graph parameters, seed, neighbor policy, external IDs, normalized vector
-rows, levels, adjacency lists, maximum level, and entry point. Its loader validates bounded
-sizes before allocation and checks every graph reference and layer relationship. Snapshot
-loading preserves query results and structural counters; continuing insertion after reload is
-not guaranteed to reproduce the original random level sequence.
+FlatIndex version 1 and HNSW version 2 persistence use distinct magic values, fixed-width
+little-endian fields, and an FNV-1a checksum. The HNSW loader also accepts version 1. The HNSW
+format preserves graph parameters, seed, neighbor policy, external IDs, normalized vector rows,
+levels, adjacency lists, maximum level, and entry point. Version 2 additionally preserves the
+current RNG state, allowing deterministic insertion continuation with a compatible standard
+library; version 1 resumes from the initial seed instead. The loader validates bounded sizes
+before allocation and checks every graph reference and layer relationship. On Linux,
+`publish_hnsw_index` validates a same-directory temporary snapshot before durable publication;
+explicit overwrite atomically replaces the destination.
 
-The gRPC server can load a FlatIndex snapshot before opening its listening port and can reject
-all later writes in read-only mode. The snapshot dimension is authoritative. On Linux, an
-explicit SIGHUP mode loads and validates a replacement outside the store lock, then swaps index
-ownership under an exclusive lock. Failed reloads preserve the current in-memory index. HNSW
-server loading and automatic saving are not implemented. The default container and Kubernetes
-commands still start with an empty index unless an operator mounts a snapshot and supplies the
-loading arguments.
+The gRPC server can load a FlatIndex or HNSW snapshot before opening its listening port and can
+reject all later writes in read-only mode. The snapshot dimension and HNSW configuration are
+authoritative. On Linux, an explicit Flat-only SIGHUP mode loads and validates a replacement
+outside the store lock, then swaps index ownership under an exclusive lock. Failed reloads
+preserve the current in-memory index. Automatic saving and HNSW hot reload are not implemented.
+The default container and Kubernetes commands still start with an empty index unless an operator
+mounts a snapshot and supplies the loading arguments.
 
 ## Deployment boundary
 
@@ -109,10 +111,10 @@ replication or consistency.
 ## Known limitations
 
 - No deletion or incremental persistence.
-- No HNSW snapshot loading in the gRPC server or concurrent HNSW construction.
+- No HNSW hot reload or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.
-- No multi-replica consistency for writable indexes; immutable read-only Flat snapshots can be
+- No multi-replica consistency for writable indexes; immutable read-only snapshots can be
   mounted consistently only when the platform supplies the same file to every Pod.
 - Direct calls to the low-level snapshot save API do not provide atomic replacement; the
   offline builder provides the durable Linux publication workflow.

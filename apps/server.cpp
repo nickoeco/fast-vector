@@ -17,6 +17,7 @@
 #include "fast_vector/flat_index.h"
 #include "fast_vector/flat_index_io.h"
 #include "fast_vector/hnsw_index.h"
+#include "fast_vector/hnsw_index_io.h"
 #include "fast_vector/vector_store.h"
 #include "service/vector_search_service.h"
 
@@ -140,9 +141,6 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
   if (config.address.empty()) {
     throw std::invalid_argument("--address must not be empty");
   }
-  if (!config.load_index_path.empty() && config.index_type != "flat") {
-    throw std::invalid_argument("--load-index currently requires --index flat");
-  }
   if (config.reload_on_sighup &&
       (config.index_type != "flat" || config.load_index_path.empty() || !config.read_only)) {
     throw std::invalid_argument(
@@ -163,6 +161,10 @@ std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config)
           fast_vector::load_flat_index(config.load_index_path, config.kernel));
     }
     return std::make_unique<fast_vector::FlatIndex>(config.dimension, config.kernel);
+  }
+  if (!config.load_index_path.empty()) {
+    return std::make_unique<fast_vector::HnswIndex>(
+        fast_vector::load_hnsw_index(config.load_index_path, config.kernel));
   }
   return std::make_unique<fast_vector::HnswIndex>(fast_vector::HnswConfig{
       .dimension = config.dimension,

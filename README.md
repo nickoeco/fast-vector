@@ -212,8 +212,11 @@ Message size is bounded separately by
 `--max-message-bytes`. Batch insertion is not transactional when an ID already exists in the
 index, as described above.
 
-The server can load a version 1 FlatIndex snapshot before accepting requests. The loaded file
-defines the index dimension; `--dimension` is used only when constructing an empty index.
+The server can load a FlatIndex version 1 or HNSW version 1/2 snapshot before accepting
+requests. Select the matching `--index flat|hnsw` type. The loaded file defines the dimension;
+`--dimension` is used only when constructing an empty index. For HNSW, the snapshot also defines
+`M`, `efConstruction`, `efSearch`, random seed, neighbor selection, graph, and RNG state (v2).
+The corresponding command-line construction options are ignored when loading a snapshot.
 Read-only mode rejects both insertion RPCs while retaining search and statistics:
 
 ```bash
@@ -226,8 +229,10 @@ Read-only mode rejects both insertion RPCs while retaining search and statistics
   --kernel auto
 ```
 
-`--load-index` currently requires `--index flat`. A loaded index remains writable unless
-`--read-only true` is supplied. The server does not save later mutations automatically.
+To serve an existing HNSW snapshot instead, use `--index hnsw --load-index /data/graph.fvh`.
+A loaded index remains writable unless `--read-only true` is supplied. The server does not save
+later mutations automatically; use read-only mode when the snapshot must remain the complete
+source of truth.
 `GetStats` reports the read-only state; snapshot vectors contribute to `vector_count` but not
 to the process-local `inserted_vectors` counter.
 
@@ -248,8 +253,8 @@ remains healthy. Multiple SIGHUP notifications may coalesce into one reload. Hot
 available for writable stores, empty indexes, HNSW, or non-Linux platforms.
 
 The server enables gRPC's standard health-check service. Transport security, authentication,
-HNSW snapshot loading at server startup, persistence during service operation, reflection, and
-production observability remain outside this phase.
+persistence during service operation, HNSW hot reload, reflection, and production observability
+remain outside this phase.
 
 The Python integration suite also exercises the complete snapshot-serving path: it builds a
 FlatIndex snapshot from `tests/data/vectors.jsonl`, starts a server on a dynamic local port,
@@ -258,6 +263,9 @@ that both single and batch writes fail with `FAILED_PRECONDITION` in read-only m
 atomically replaces the snapshot, signals a live reload, and verifies that a corrupt subsequent
 snapshot cannot replace the valid in-memory index. Set
 `FAST_VECTOR_SERVER` and `FAST_VECTOR_BUILDER` when the executables are outside `build-grpc`.
+The same suite loads a generated HNSW snapshot through the server, checks health, search,
+statistics, read-only rejection and writable continuation, and rejects a corrupt snapshot at
+startup. Set `FAST_VECTOR_HNSW_FIXTURE` as well when its test executable is outside `build-grpc`.
 
 ### Python client and service load test
 
@@ -534,27 +542,41 @@ or pointers, and loading rebuilds the duplicate-ID set. The low-level `save_flat
 writes exactly the requested path and does not provide crash-atomic replacement. Use the offline
 builder when publishing or replacing a deployable snapshot.
 
-`HnswIndex` has a separate version 1 binary format:
+`HnswIndex` has a separate version 2 binary format (the loader also accepts version 1):
 
 ```cpp
 #include "fast_vector/hnsw_index_io.h"
 
 fast_vector::save_hnsw_index(index, "graph.fvh");
 fast_vector::HnswIndex restored = fast_vector::load_hnsw_index("graph.fvh");
+fast_vector::publish_hnsw_index(index, "published.fvh");
+fast_vector::publish_hnsw_index(index, "published.fvh", true);  // Explicit replacement.
 ```
 
 Its 112-byte little-endian header stores an HNSW-specific magic, version, header size,
 endianness marker, cosine flag, dimension, node count, `M`, `efConstruction`, `efSearch`, random
 seed, neighbor selection strategy, maximum level, entry point, payload size, and checksum.
 The payload contains ordered external IDs, contiguous normalized float32 vectors, then each
-node's level and per-layer degree and NodeIndex list. FNV-1a covers the header fields (except
-the checksum slot) and entire payload. The loader rejects invalid configuration, size or
-arithmetic overflow, duplicate IDs, non-finite or unnormalized vectors, excessive degrees,
-out-of-range or repeated neighbors, self-loops, invalid layer references, and an invalid entry
-point. FNV-1a detects accidental corruption, not intentional tampering. The runtime dot-product
-kernel is chosen on load and is not serialized. The random seed is retained, but continuation
-of the exact pre-save insertion RNG sequence is not guaranteed. Direct HNSW save writes the
-requested path; use a separate path when preserving an existing snapshot matters.
+node's level and per-layer degree and NodeIndex list. Version 2 appends the current
+`std::mt19937_64` state as a length-prefixed, classic-locale stream representation, so insertion
+can continue with the same level sequence on a compatible C++ standard-library implementation.
+Version 1 loads with the saved seed but cannot reproduce the pre-save RNG position. FNV-1a
+covers the header fields (except the checksum slot) and entire payload. The loader rejects
+invalid configuration, size or arithmetic overflow, duplicate IDs, non-finite or unnormalized
+vectors, excessive degrees, out-of-range or repeated neighbors, self-loops, invalid layer
+references, an invalid entry point, and malformed RNG state. FNV-1a detects accidental
+corruption, not intentional tampering.
+The runtime dot-product kernel is chosen on load and is not serialized. Direct
+`save_hnsw_index` writes the requested path and can truncate an existing file. On Linux,
+`publish_hnsw_index` writes a same-directory temporary file, reloads it for validation,
+`fsync()`s the file, publishes without overwrite by default (or atomically replaces with
+`overwrite=true`), then `fsync()`s the parent directory. Pre-publication failures leave the
+existing destination unchanged. A directory `fsync()` failure after publication is reported,
+but cannot roll back the new directory entry. This API is unsupported on non-Linux platforms.
+As with other HNSW operations, callers must not mutate the index concurrently with snapshotting.
+Crash-durability guarantees require a filesystem that honors Linux `fsync()` and atomic
+same-directory link/rename semantics; WSL `/mnt/c` (DrvFs) should not be treated as proof of
+physical power-loss durability.
 
 Measure persistence costs in a Release build:
 
@@ -708,7 +730,7 @@ No release tag is created automatically.
 
 ## Roadmap
 
-Planned work adds transport security, HNSW service loading, production observability, and writable
+Planned work adds transport security, HNSW hot reload, production observability, and writable
 multi-replica consistency. The exact `FlatIndex` remains the correctness and recall baseline
 for approximate indexes.
 
