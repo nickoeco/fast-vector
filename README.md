@@ -15,14 +15,15 @@ a from-scratch approximate HNSW index using cosine similarity.
 - Unit tests, command-line demo, and a reproducible single-thread benchmark
 - Cross-language correctness validation against exact NumPy ground truth
 - Versioned binary save/load for `FlatIndex`, with structural and checksum validation
+- Versioned binary save/load for `HnswIndex`, including graph and configuration validation
 - Ordered batch search backed by a reusable fixed-size worker pool
 - Selectable scalar, compiler-auto-vectorized, and optional AVX2 dot-product kernels
 - In-memory single-threaded HNSW construction and approximate cosine search
 - Thread-safe `VectorStore` application layer with serialized insertion and concurrent search
 - Optional synchronous gRPC server with protobuf code generation and standard health checks
 
-HNSW persistence, deletion, authentication, TLS, and metadata storage are not implemented yet.
-Persistence currently means complete `FlatIndex` snapshot save/load; incremental
+Deletion, authentication, TLS, and metadata storage are not implemented yet.
+Persistence currently means complete FlatIndex and HnswIndex snapshots; incremental
 persistence is not implemented. HNSW supports both simple nearest-M and diversity-aware
 neighbor selection, with reproducible Recall@K validation against NumPy ground truth.
 The gRPC transport supports insertion, non-transactional batch insertion, search, statistics,
@@ -247,8 +248,8 @@ remains healthy. Multiple SIGHUP notifications may coalesce into one reload. Hot
 available for writable stores, empty indexes, HNSW, or non-Linux platforms.
 
 The server enables gRPC's standard health-check service. Transport security, authentication,
-HNSW loading, persistence during service operation, reflection, and production observability
-remain outside this phase.
+HNSW snapshot loading at server startup, persistence during service operation, reflection, and
+production observability remain outside this phase.
 
 The Python integration suite also exercises the complete snapshot-serving path: it builds a
 FlatIndex snapshot from `tests/data/vectors.jsonl`, starts a server on a dynamic local port,
@@ -533,6 +534,42 @@ or pointers, and loading rebuilds the duplicate-ID set. The low-level `save_flat
 writes exactly the requested path and does not provide crash-atomic replacement. Use the offline
 builder when publishing or replacing a deployable snapshot.
 
+`HnswIndex` has a separate version 1 binary format:
+
+```cpp
+#include "fast_vector/hnsw_index_io.h"
+
+fast_vector::save_hnsw_index(index, "graph.fvh");
+fast_vector::HnswIndex restored = fast_vector::load_hnsw_index("graph.fvh");
+```
+
+Its 112-byte little-endian header stores an HNSW-specific magic, version, header size,
+endianness marker, cosine flag, dimension, node count, `M`, `efConstruction`, `efSearch`, random
+seed, neighbor selection strategy, maximum level, entry point, payload size, and checksum.
+The payload contains ordered external IDs, contiguous normalized float32 vectors, then each
+node's level and per-layer degree and NodeIndex list. FNV-1a covers the header fields (except
+the checksum slot) and entire payload. The loader rejects invalid configuration, size or
+arithmetic overflow, duplicate IDs, non-finite or unnormalized vectors, excessive degrees,
+out-of-range or repeated neighbors, self-loops, invalid layer references, and an invalid entry
+point. FNV-1a detects accidental corruption, not intentional tampering. The runtime dot-product
+kernel is chosen on load and is not serialized. The random seed is retained, but continuation
+of the exact pre-save insertion RNG sequence is not guaranteed. Direct HNSW save writes the
+requested path; use a separate path when preserving an existing snapshot matters.
+
+Measure persistence costs in a Release build:
+
+```bash
+./build-release/fast_vector_hnsw_persistence_benchmark \
+  --vectors 1000 --dimension 128 --m 16 \
+  --ef-construction 100 --ef-search 50 \
+  --data-seed 20250908 --graph-seed 42
+```
+
+The output reports build, save, and load times separately, file size, graph edge count, and
+Linux process RSS before and after loading. The RSS delta is an approximate process-wide
+observation, not the exact retained memory of the loaded index. No performance numbers are
+pre-filled in this README.
+
 ### Offline FlatIndex builder
 
 `fast_vector_build_index` converts the embedding pipeline's `vectors.jsonl` into a deployable
@@ -671,7 +708,7 @@ No release tag is created automatically.
 
 ## Roadmap
 
-Planned work adds transport security, HNSW persistence, production observability, and writable
+Planned work adds transport security, HNSW service loading, production observability, and writable
 multi-replica consistency. The exact `FlatIndex` remains the correctness and recall baseline
 for approximate indexes.
 

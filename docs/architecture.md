@@ -72,15 +72,19 @@ to chunks. The output is retrieval evidence, not an LLM-generated answer.
 
 ## Persistence
 
-Version 1 persistence supports complete `FlatIndex` snapshots. The format has fixed-width
-little-endian fields, a magic value, version, dimensions, counts, flags, payload size, and an
-FNV-1a checksum. Loading validates all structural limits before allocating large buffers.
+Version 1 persistence supports complete `FlatIndex` and `HnswIndex` snapshots with distinct
+magic values. Both formats use fixed-width little-endian fields and an FNV-1a checksum. The
+HNSW format preserves graph parameters, seed, neighbor policy, external IDs, normalized vector
+rows, levels, adjacency lists, maximum level, and entry point. Its loader validates bounded
+sizes before allocation and checks every graph reference and layer relationship. Snapshot
+loading preserves query results and structural counters; continuing insertion after reload is
+not guaranteed to reproduce the original random level sequence.
 
 The gRPC server can load a FlatIndex snapshot before opening its listening port and can reject
 all later writes in read-only mode. The snapshot dimension is authoritative. On Linux, an
 explicit SIGHUP mode loads and validates a replacement outside the store lock, then swaps index
 ownership under an exclusive lock. Failed reloads preserve the current in-memory index. HNSW
-persistence and automatic saving are not implemented. The default container and Kubernetes
+server loading and automatic saving are not implemented. The default container and Kubernetes
 commands still start with an empty index unless an operator mounts a snapshot and supplies the
 loading arguments.
 
@@ -105,7 +109,7 @@ replication or consistency.
 ## Known limitations
 
 - No deletion or incremental persistence.
-- No HNSW persistence or concurrent HNSW construction.
+- No HNSW snapshot loading in the gRPC server or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.
 - No multi-replica consistency for writable indexes; immutable read-only Flat snapshots can be
