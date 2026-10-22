@@ -24,6 +24,7 @@ add_library(fast_vector
     src/flat_index_io.cpp
     src/hnsw_index.cpp
     src/hnsw_index_io.cpp
+    src/hnsw_index_publish.cpp
     src/vector_store.cpp
 )
 add_library(fast_vector::fast_vector ALIAS fast_vector)
@@ -177,6 +178,11 @@ if(FAST_VECTOR_BUILD_GRPC)
     fast_vector_enable_sanitizers(fast_vector_server)
 
     if(FAST_VECTOR_BUILD_TESTS)
+        add_executable(fast_vector_hnsw_snapshot_fixture tests/make_hnsw_snapshot.cpp)
+        target_link_libraries(fast_vector_hnsw_snapshot_fixture PRIVATE fast_vector::fast_vector)
+        fast_vector_set_warnings(fast_vector_hnsw_snapshot_fixture)
+        fast_vector_enable_sanitizers(fast_vector_hnsw_snapshot_fixture)
+
         add_executable(fast_vector_grpc_tests tests/test_grpc_service.cpp)
         target_link_libraries(fast_vector_grpc_tests
             PRIVATE fast_vector_grpc_service GTest::gtest_main

@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -19,8 +21,10 @@ namespace fast_vector {
 namespace {
 
 constexpr std::array<unsigned char, 8> kMagic{'F', 'V', 'H', 'N', 'S', 'W', '\0', '\0'};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kCurrentVersion = 2;
+constexpr std::uint32_t kLegacyVersion = 1;
 constexpr std::uint32_t kHeaderSize = 112;
+constexpr std::uint32_t kMaximumRngStateBytes = 16 * 1024;
 constexpr std::uint32_t kEndianMarker = 0x01020304U;
 constexpr std::uint32_t kNormalizedCosineFlag = 1U;
 constexpr std::uint32_t kMaximumLevel = 63;
@@ -103,6 +107,7 @@ UInt read_integer(std::istream& input, std::uint64_t* checksum) {
 }
 
 struct Header {
+  std::uint32_t version;
   std::uint64_t dimension;
   std::uint64_t count;
   std::uint64_t max_connections;
@@ -119,7 +124,7 @@ void checksum_header(std::uint64_t& checksum, const Header& header) {
   for (const unsigned char byte : kMagic) {
     update_checksum(checksum, byte);
   }
-  checksum_integer(checksum, kVersion);
+  checksum_integer(checksum, header.version);
   checksum_integer(checksum, kHeaderSize);
   checksum_integer(checksum, kEndianMarker);
   checksum_integer(checksum, kNormalizedCosineFlag);
@@ -139,7 +144,7 @@ void checksum_header(std::uint64_t& checksum, const Header& header) {
 void write_header(std::ostream& output, const Header& header, const std::uint64_t checksum) {
   output.write(reinterpret_cast<const char*>(kMagic.data()),
                static_cast<std::streamsize>(kMagic.size()));
-  write_integer(output, kVersion);
+  write_integer(output, header.version);
   write_integer(output, kHeaderSize);
   write_integer(output, kEndianMarker);
   write_integer(output, kNormalizedCosineFlag);
@@ -166,11 +171,13 @@ Header read_header(std::istream& input, std::uint64_t& checksum, std::uint64_t& 
   for (const unsigned char byte : magic) {
     update_checksum(checksum, byte);
   }
-  if (read_integer<std::uint32_t>(input, &checksum) != kVersion) {
+  Header header{};
+  header.version = read_integer<std::uint32_t>(input, &checksum);
+  if (header.version != kLegacyVersion && header.version != kCurrentVersion) {
     fail("unsupported format version");
   }
   if (read_integer<std::uint32_t>(input, &checksum) != kHeaderSize) {
-    fail("header size does not match version 1");
+    fail("header size does not match the format version");
   }
   if (read_integer<std::uint32_t>(input, &checksum) != kEndianMarker) {
     fail("endianness marker does not match");
@@ -178,7 +185,6 @@ Header read_header(std::istream& input, std::uint64_t& checksum, std::uint64_t& 
   if (read_integer<std::uint32_t>(input, &checksum) != kNormalizedCosineFlag) {
     fail("unsupported index flags");
   }
-  Header header{};
   header.dimension = read_integer<std::uint64_t>(input, &checksum);
   header.count = read_integer<std::uint64_t>(input, &checksum);
   header.max_connections = read_integer<std::uint64_t>(input, &checksum);
@@ -213,8 +219,12 @@ void validate_header(const Header& header, const std::uintmax_t file_bytes) {
   const std::uint64_t vector_bytes = checked_multiply(elements, sizeof(float), "vector bytes");
   const std::uint64_t id_bytes = checked_multiply(header.count, sizeof(VectorId), "ID bytes");
   const std::uint64_t minimum_graph_bytes = checked_multiply(header.count, 8, "graph bytes");
-  const std::uint64_t minimum_payload =
+  std::uint64_t minimum_payload =
       checked_add(checked_add(id_bytes, vector_bytes, "payload"), minimum_graph_bytes, "payload");
+  if (header.version == kCurrentVersion) {
+    minimum_payload =
+        checked_add(minimum_payload, sizeof(std::uint32_t) + 1, "RNG state and payload");
+  }
   if (header.payload_bytes < minimum_payload) {
     fail("payload is too small for the declared dimensions and node count");
   }
@@ -228,8 +238,12 @@ void validate_header(const Header& header, const std::uintmax_t file_bytes) {
                   checked_multiply(kMaximumLevel + 1, maximum_layer_bytes, "graph bytes"),
                   "graph bytes"),
       "graph bytes");
-  const std::uint64_t maximum_payload =
+  std::uint64_t maximum_payload =
       checked_add(checked_add(id_bytes, vector_bytes, "payload"), maximum_graph_bytes, "payload");
+  if (header.version == kCurrentVersion) {
+    maximum_payload = checked_add(maximum_payload, sizeof(std::uint32_t) + kMaximumRngStateBytes,
+                                  "RNG state and payload");
+  }
   if (header.payload_bytes > maximum_payload ||
       checked_add(kHeaderSize, header.payload_bytes, "file size") != file_bytes) {
     fail("file size does not match the header");
@@ -268,7 +282,18 @@ class HnswIndexSerializer {
             "payload");
       }
     }
+    std::ostringstream random_state_stream;
+    random_state_stream.imbue(std::locale::classic());
+    random_state_stream << index.random_;
+    const std::string random_state = random_state_stream.str();
+    if (!random_state_stream || random_state.empty() ||
+        random_state.size() > kMaximumRngStateBytes) {
+      fail("RNG state cannot be represented in the snapshot format");
+    }
+    payload_bytes =
+        checked_add(payload_bytes, sizeof(std::uint32_t) + random_state.size(), "payload");
     const Header header{
+        kCurrentVersion,
         dimension,
         count,
         index.config_.max_connections,
@@ -297,6 +322,10 @@ class HnswIndexSerializer {
         }
       }
     }
+    checksum_integer(checksum, static_cast<std::uint32_t>(random_state.size()));
+    for (const unsigned char byte : random_state) {
+      update_checksum(checksum, byte);
+    }
 
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) {
@@ -318,6 +347,8 @@ class HnswIndexSerializer {
         }
       }
     }
+    write_integer(output, static_cast<std::uint32_t>(random_state.size()));
+    output.write(random_state.data(), static_cast<std::streamsize>(random_state.size()));
     output.flush();
     if (!output) {
       throw std::runtime_error("failed to flush HNSW index: " + path.string());
@@ -434,6 +465,33 @@ class HnswIndexSerializer {
             fail("neighbor is not present on the referenced layer");
           }
         }
+      }
+    }
+    if (header.version == kCurrentVersion) {
+      const std::uint32_t state_length = read_integer<std::uint32_t>(input, &checksum);
+      const auto position = input.tellg();
+      const std::uint64_t file_end = checked_add(kHeaderSize, header.payload_bytes, "file size");
+      if (state_length == 0 || state_length > kMaximumRngStateBytes || position < 0 ||
+          static_cast<std::uint64_t>(position) > file_end ||
+          state_length != file_end - static_cast<std::uint64_t>(position)) {
+        fail("RNG state length does not match the payload");
+      }
+      std::string random_state(state_length, '\0');
+      input.read(random_state.data(), static_cast<std::streamsize>(random_state.size()));
+      if (!input) {
+        fail("RNG state is truncated");
+      }
+      for (const unsigned char byte : random_state) {
+        update_checksum(checksum, byte);
+      }
+      std::istringstream random_state_stream(random_state);
+      random_state_stream.imbue(std::locale::classic());
+      if (!(random_state_stream >> index.random_)) {
+        fail("RNG state is invalid");
+      }
+      random_state_stream >> std::ws;
+      if (!random_state_stream.eof()) {
+        fail("RNG state contains trailing data");
       }
     }
     if (checksum != stored_checksum) {
