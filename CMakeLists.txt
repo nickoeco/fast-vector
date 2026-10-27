@@ -186,7 +186,7 @@ endif()
 if(FAST_VECTOR_BUILD_GRPC)
     include(cmake/GrpcCodegen.cmake)
 
-    add_library(fast_vector_grpc_service service/vector_search_service.cpp)
+    add_library(fast_vector_grpc_service service/vector_search_service.cpp service/structured_logger.cpp)
     target_include_directories(fast_vector_grpc_service PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fast_vector_grpc_service
         PUBLIC fast_vector::fast_vector fast_vector_grpc_proto
@@ -200,7 +200,7 @@ if(FAST_VECTOR_BUILD_GRPC)
     fast_vector_enable_sanitizers(fast_vector_server)
 
     if(FAST_VECTOR_BUILD_TESTS)
-        add_executable(fast_vector_grpc_tests tests/test_grpc_service.cpp)
+        add_executable(fast_vector_grpc_tests tests/test_grpc_service.cpp tests/test_structured_logger.cpp)
         target_link_libraries(fast_vector_grpc_tests
             PRIVATE fast_vector_grpc_service GTest::gtest_main
         )

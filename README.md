@@ -309,6 +309,11 @@ If loading fails, the server logs the error, keeps serving the previous in-memor
 remains healthy. Multiple SIGHUP notifications may coalesce into one reload. Hot reload is not
 available for writable stores, empty indexes, HNSW, or non-Linux platforms.
 
+The server writes structured JSON Lines to stderr for startup configuration, snapshot loading,
+RPC outcomes, shutdown reasons, and per-status error totals. It logs only allowlisted metadata;
+vectors, document text, request metadata, snapshot paths, and raw exception messages are excluded.
+See [structured logging](docs/logging.md) for fields, timing boundaries, collection, and limitations.
+
 The server enables gRPC's standard health-check service. Transport security, authentication,
 persistence during service operation, HNSW hot reload, reflection, and production observability
 remain outside this phase.

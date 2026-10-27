@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
-import select
+import json
+import concurrent.futures
+from collections import Counter
 import signal
 import socket
 import subprocess
@@ -33,12 +35,20 @@ def reserve_local_port() -> int:
 
 
 def stop_server(server: subprocess.Popen[str]) -> tuple[str, str]:
-    server.terminate()
+    if server.poll() is None:
+        server.terminate()
     try:
-        return server.communicate(timeout=5)
+        stdout, stderr = server.communicate(timeout=5)
     except subprocess.TimeoutExpired:
         server.kill()
-        return server.communicate(timeout=5)
+        stdout, stderr = server.communicate(timeout=5)
+    return stdout or "", stderr or ""
+
+
+def read_log_records(path: Path) -> list[dict]:
+    # A live writer may not have completed the final line yet.
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines(keepends=True)
+            if line.endswith("\n")]
 
 
 class StatisticsTest(unittest.TestCase):
@@ -147,6 +157,8 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
         cls._builder_path = builder_path
         cls._snapshot_path = snapshot_path
         cls._temporary_path = temporary_path
+        cls._log_path = temporary_path / "server.jsonl"
+        cls._log_output = cls._log_path.open("w", encoding="utf-8")
         generate(REPOSITORY_ROOT / "proto", generated_directory)
 
         build_result = subprocess.run(
@@ -166,6 +178,7 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
             check=False,
         )
         if build_result.returncode != 0:
+            cls._log_output.close()
             cls._temporary_directory.cleanup()
             raise RuntimeError(
                 "index builder failed\n"
@@ -193,7 +206,7 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
                 "scalar",
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=cls._log_output,
             text=True,
         )
         try:
@@ -202,6 +215,7 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
             )
         except (grpc.RpcError, grpc.FutureTimeoutError):
             stdout, stderr = stop_server(cls._server)
+            cls._log_output.close()
             cls._temporary_directory.cleanup()
             raise RuntimeError(f"server did not become ready\nstdout: {stdout}\nstderr: {stderr}")
 
@@ -211,6 +225,8 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
             cls._client.close()
         if hasattr(cls, "_server"):
             stop_server(cls._server)
+        if hasattr(cls, "_log_output"):
+            cls._log_output.close()
         if hasattr(cls, "_temporary_directory"):
             cls._temporary_directory.cleanup()
 
@@ -221,6 +237,15 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
                 health_pb2.HealthCheckRequest(service=""), timeout=5.0
             )
             self.assertEqual(response.status, health_pb2.HealthCheckResponse.SERVING)
+
+        startup_records = read_log_records(self._log_path)
+        loaded = next(record for record in startup_records if record["event"] == "index_load_completed")
+        self.assertEqual(loaded["vector_count"], 3)
+        self.assertEqual(loaded["operation"], "startup")
+        self.assertGreaterEqual(loaded["latency_us"], 0)
+        configuration = next(record for record in startup_records if record["event"] == "startup_config")
+        self.assertEqual(configuration["config_source"], "snapshot")
+        self.assertEqual(configuration["dimension"], 3)
 
         result = self._client.search([1.0, 0.0, 0.0], 3)
         self.assertEqual([neighbor.id for neighbor in result.neighbors], [101, 102, 103])
@@ -289,10 +314,14 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
 
         self._snapshot_path.write_bytes(b"corrupt snapshot")
         os.kill(self._server.pid, signal.SIGHUP)
-        readable, _, _ = select.select([self._server.stderr], [], [], 5.0)
-        self.assertTrue(readable, "server did not report the failed reload before the timeout")
-        reload_error = self._server.stderr.readline()
-        self.assertIn("Snapshot reload failed", reload_error)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if any(record["event"] == "index_load_failed" and record.get("operation") == "reload"
+                   for record in read_log_records(self._log_path)):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("server did not log a structured reload failure")
 
         preserved = self._client.search([0.0, 0.0, 1.0], 1)
         self.assertEqual([neighbor.id for neighbor in preserved.neighbors], [999])
@@ -382,6 +411,9 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
         self.assertEqual(stats.dimension, 3)
         self.assertTrue(stats.read_only)
         self.assertEqual(stats.inserted_vectors, 0)
+        # ID 999 is a tombstone in the fixture, even though its vector matches this query.
+        surviving = self._client.search([0.0, 0.0, 1.0], 10)
+        self.assertEqual([neighbor.id for neighbor in surviving.neighbors], [101, 102, 103])
         with self.assertRaises(grpc.RpcError) as context:
             self._client.add(104, [0.0, 0.0, 1.0])
         self.assertEqual(context.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
@@ -405,7 +437,10 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid HNSW index", result.stderr)
+        records = [json.loads(line) for line in result.stderr.splitlines()]
+        self.assertTrue(any(record["event"] == "index_load_failed" and
+                            record["status"] == "FAILED_PRECONDITION" for record in records))
+        self.assertNotIn(str(corrupt_path), result.stderr)
 
     def test_hnsw_sighup_reload_remains_unsupported(self) -> None:
         result = subprocess.run(
@@ -426,7 +461,9 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("read-only FlatIndex", result.stderr)
+        records = [json.loads(line) for line in result.stderr.splitlines()]
+        self.assertEqual(records[-1]["event"], "startup_failed")
+        self.assertEqual(records[-1]["status"], "INVALID_ARGUMENT")
 
     def test_loaded_snapshot_can_accept_runtime_writes(self) -> None:
         address = f"127.0.0.1:{reserve_local_port()}"
@@ -453,6 +490,120 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
                 self.assertEqual(stats.inserted_vectors, 1)
         finally:
             stop_server(server)
+
+
+class StructuredLoggingIntegrationTest(unittest.TestCase):
+    def test_sigint_shutdown_reason(self) -> None:
+        server_path = Path(os.environ.get(
+            "FAST_VECTOR_SERVER", REPOSITORY_ROOT / "build-grpc" / "fast_vector_server"
+        ))
+        if not server_path.is_file():
+            self.skipTest(f"gRPC server executable not found: {server_path}")
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "server.jsonl"
+            address = f"127.0.0.1:{reserve_local_port()}"
+            with log_path.open("w", encoding="utf-8") as output:
+                server = subprocess.Popen(
+                    [str(server_path), "--address", address, "--index", "flat", "--dimension", "3"],
+                    stdout=subprocess.DEVNULL, stderr=output,
+                )
+                try:
+                    with grpc.insecure_channel(address) as channel:
+                        grpc.channel_ready_future(channel).result(timeout=5.0)
+                    server.send_signal(signal.SIGINT)
+                    server.wait(timeout=5)
+                    self.assertEqual(server.returncode, 0)
+                finally:
+                    if server.poll() is None:
+                        server.kill()
+                        server.wait(timeout=5)
+            completed = [record for record in read_log_records(log_path)
+                         if record["event"] == "shutdown_completed"]
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0]["reason"], "SIGINT")
+
+    def test_concurrent_rpc_logs_privacy_summary_and_shutdown(self) -> None:
+        server_path = Path(os.environ.get(
+            "FAST_VECTOR_SERVER", REPOSITORY_ROOT / "build-grpc" / "fast_vector_server"
+        ))
+        if not server_path.is_file():
+            self.skipTest(f"gRPC server executable not found: {server_path}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = root / "generated"
+            generate(REPOSITORY_ROOT / "proto", generated)
+            address = f"127.0.0.1:{reserve_local_port()}"
+            log_path = root / "server.jsonl"
+            with log_path.open("w", encoding="utf-8") as output:
+                server = subprocess.Popen(
+                    [str(server_path), "--address", address, "--index", "flat", "--dimension", "3",
+                     "--max-batch-size", "2"],
+                    stdout=subprocess.PIPE, stderr=output, text=True,
+                )
+                try:
+                    with VectorSearchClient(address, generated, timeout_seconds=5.0) as client:
+                        client.add(101, [98765.125, 0.0, 0.0])
+                        client.add_batch([(102, [0.0, 1.0, 0.0])])
+                        client.search([12345.625, 0.0, 0.0], 1)
+                        with self.assertRaises(grpc.RpcError) as invalid:
+                            client._stub.Search(
+                                client._messages.SearchRequest(query=[123456.789], k=1),
+                                metadata=(("authorization", "PRIVATE_AUTH_VALUE"),), timeout=5.0,
+                            )
+                        self.assertEqual(invalid.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+                        with self.assertRaises(grpc.RpcError) as oversized:
+                            client.add_batch([(201 + i, [1.0, 0.0, 0.0]) for i in range(3)])
+                        self.assertEqual(oversized.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+                        client.stats()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                            futures = [pool.submit(client.search, [1.0, 0.0, 0.0], 1)
+                                       for _ in range(16)]
+                            for future in futures:
+                                self.assertEqual(future.result().neighbors[0].id, 101)
+                finally:
+                    stdout, _ = stop_server(server)
+                self.assertEqual(server.returncode, 0)
+                self.assertEqual(stdout, "")
+            raw = log_path.read_text(encoding="utf-8")
+            records = read_log_records(log_path)
+            self.assertEqual(len(records), len(raw.splitlines()))
+            for record in records:
+                self.assertRegex(record["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+                self.assertIn(record["severity"], ("INFO", "WARN", "ERROR"))
+                for field in ("event", "request_id", "method", "status", "latency_us",
+                              "index_type", "vector_count"):
+                    self.assertIn(field, record)
+            completed = [record for record in records if record["event"] == "rpc_completed"]
+            self.assertEqual(len(completed), 22)
+            self.assertEqual(len({record["request_id"] for record in completed}), 22)
+            self.assertEqual({record["method"] for record in completed},
+                             {"AddVector", "BatchAdd", "Search", "GetStats"})
+            for record in completed:
+                self.assertTrue(record["request_id"].isdigit())
+                self.assertGreaterEqual(record["latency_us"], 0)
+                self.assertEqual(record["index_type"], "flat")
+                self.assertIsInstance(record["vector_count"], int)
+            statuses = Counter(record["status"] for record in completed)
+            self.assertEqual(statuses, {"OK": 20, "INVALID_ARGUMENT": 1, "RESOURCE_EXHAUSTED": 1})
+            error_summaries = {record["status"]: record["count"] for record in records
+                               if record["event"] == "rpc_error_summary"}
+            self.assertEqual(error_summaries, {"INVALID_ARGUMENT": 1, "RESOURCE_EXHAUSTED": 1})
+            totals = [record for record in records if record["event"] == "rpc_summary"]
+            self.assertEqual(len(totals), 1)
+            self.assertEqual(totals[0]["completed_rpcs"], 22)
+            self.assertEqual(totals[0]["successful_rpcs"], 20)
+            self.assertEqual(totals[0]["failed_rpcs"], 2)
+            self.assertEqual(totals[0]["dropped_log_records"], 0)
+            shutdown = [record for record in records if record["event"] == "shutdown_completed"]
+            self.assertEqual(len(shutdown), 1)
+            self.assertEqual(shutdown[0]["reason"], "SIGTERM")
+            config = next(record for record in records if record["event"] == "startup_config")
+            self.assertEqual(config["dimension"], 3)
+            self.assertEqual(config["max_batch_size"], 2)
+            for private in ("98765.125", "12345.625", "123456.789", "PRIVATE_AUTH_VALUE"):
+                self.assertNotIn(private, raw)
+            for record in records:
+                self.assertFalse({"query", "values", "text", "metadata", "error_message"} & record.keys())
 
 
 if __name__ == "__main__":

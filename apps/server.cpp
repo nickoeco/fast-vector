@@ -1,5 +1,6 @@
 #include <grpcpp/grpcpp.h>
 
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -9,6 +10,8 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -23,11 +26,28 @@
 
 namespace {
 
-volatile std::sig_atomic_t stop_requested = 0;
-volatile std::sig_atomic_t reload_requested = 0;
+std::atomic<std::sig_atomic_t> stop_requested{0};
+std::atomic<std::sig_atomic_t> reload_requested{0};
+static_assert(std::atomic<std::sig_atomic_t>::is_always_lock_free);
 
-void handle_stop_signal(int) { stop_requested = 1; }
-void handle_reload_signal(int) { reload_requested = 1; }
+void handle_stop_signal(const int signal) {
+  stop_requested.store(signal, std::memory_order_relaxed);
+}
+void handle_reload_signal(int) { reload_requested.store(1, std::memory_order_relaxed); }
+
+using fast_vector::service::LogField;
+using fast_vector::service::StructuredLogger;
+
+std::string_view shutdown_reason() {
+  const auto signal = stop_requested.load(std::memory_order_relaxed);
+  return signal == SIGINT ? "SIGINT" : (signal == SIGTERM ? "SIGTERM" : "internal_stop");
+}
+
+std::uint64_t elapsed_us(const std::chrono::steady_clock::time_point start) {
+  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
+}
 
 struct ServerConfig {
   std::string address = "0.0.0.0:50051";
@@ -154,17 +174,51 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
   return config;
 }
 
-std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config) {
-  if (config.index_type == "flat") {
-    if (!config.load_index_path.empty()) {
-      return std::make_unique<fast_vector::FlatIndex>(
+std::unique_ptr<fast_vector::VectorIndex> load_snapshot(
+    const ServerConfig& config, StructuredLogger& logger, const std::string_view operation,
+    const std::optional<std::uint64_t> previous_count = std::nullopt) {
+  logger.write(
+      {.event = "index_load_started", .status = "IN_PROGRESS", .index_type = config.index_type},
+      {{"operation", operation}});
+  const auto start = std::chrono::steady_clock::now();
+  try {
+    std::unique_ptr<fast_vector::VectorIndex> index;
+    if (config.index_type == "flat") {
+      index = std::make_unique<fast_vector::FlatIndex>(
           fast_vector::load_flat_index(config.load_index_path, config.kernel));
+    } else {
+      index = std::make_unique<fast_vector::HnswIndex>(
+          fast_vector::load_hnsw_index(config.load_index_path, config.kernel));
     }
-    return std::make_unique<fast_vector::FlatIndex>(config.dimension, config.kernel);
+    logger.write(
+        {.event = "index_load_completed",
+         .status = "OK",
+         .latency_us = elapsed_us(start),
+         .index_type = config.index_type,
+         .vector_count = index->size()},
+        {{"operation", operation}, {"dimension", static_cast<std::uint64_t>(index->dimension())}});
+    return index;
+  } catch (...) {
+    logger.write({.severity = "ERROR",
+                  .event = "index_load_failed",
+                  .status = "FAILED_PRECONDITION",
+                  .latency_us = elapsed_us(start),
+                  .index_type = config.index_type,
+                  .vector_count = previous_count},
+                 {{"operation", operation},
+                  {"kept_previous_index", previous_count.has_value()},
+                  {"reason", std::string_view("snapshot_unavailable_or_invalid")}});
+    throw;
   }
+}
+
+std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config,
+                                                     StructuredLogger& logger) {
   if (!config.load_index_path.empty()) {
-    return std::make_unique<fast_vector::HnswIndex>(
-        fast_vector::load_hnsw_index(config.load_index_path, config.kernel));
+    return load_snapshot(config, logger, "startup");
+  }
+  if (config.index_type == "flat") {
+    return std::make_unique<fast_vector::FlatIndex>(config.dimension, config.kernel);
   }
   return std::make_unique<fast_vector::HnswIndex>(fast_vector::HnswConfig{
       .dimension = config.dimension,
@@ -177,24 +231,71 @@ std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config)
   });
 }
 
-void print_usage() {
-  std::cerr << "Usage: fast_vector_server [--address HOST:PORT] [--index flat|hnsw] "
-               "[--dimension D] [--max-batch-size N] [--max-message-bytes N] "
-               "[--kernel scalar|auto|avx2] [--m M] [--ef-construction N] "
-               "[--ef-search N] [--hnsw-seed S] "
-               "[--neighbor-selection simple|heuristic] [--load-index PATH] "
-               "[--read-only true|false] [--reload-on-sighup true|false]\n";
+constexpr char kUsage[] =
+    "fast_vector_server [--address HOST:PORT] [--index flat|hnsw] "
+    "[--dimension D] [--max-batch-size N] [--max-message-bytes N] "
+    "[--kernel scalar|auto|avx2] [--m M] [--ef-construction N] "
+    "[--ef-search N] [--hnsw-seed S] "
+    "[--neighbor-selection simple|heuristic] [--load-index PATH] "
+    "[--read-only true|false] [--reload-on-sighup true|false]";
+
+void log_config(const ServerConfig& config, const fast_vector::VectorIndex& index,
+                StructuredLogger& logger) {
+  const auto* hnsw = dynamic_cast<const fast_vector::HnswIndex*>(&index);
+  const std::array<LogField, 12> fields{{
+      {"dimension", static_cast<std::uint64_t>(index.dimension())},
+      {"kernel", std::string_view(fast_vector::dot_product_kernel_name(config.kernel))},
+      {"read_only", config.read_only},
+      {"config_source", std::string_view(config.load_index_path.empty() ? "cli" : "snapshot")},
+      {"reload_on_sighup", config.reload_on_sighup},
+      {"max_batch_size", static_cast<std::uint64_t>(config.maximum_batch_size)},
+      {"max_message_bytes", static_cast<std::uint64_t>(config.maximum_message_bytes)},
+      {"m", static_cast<std::uint64_t>(hnsw ? hnsw->config().max_connections : 0)},
+      {"ef_construction", static_cast<std::uint64_t>(hnsw ? hnsw->config().ef_construction : 0)},
+      {"ef_search", static_cast<std::uint64_t>(hnsw ? hnsw->config().ef_search : 0)},
+      {"hnsw_seed", hnsw ? hnsw->config().random_seed : std::uint64_t{0}},
+      {"neighbor_selection",
+       std::string_view(hnsw && hnsw->config().neighbor_selection ==
+                                    fast_vector::HnswNeighborSelection::Heuristic
+                            ? "heuristic"
+                            : "simple")},
+  }};
+  logger.write({.event = "startup_config",
+                .status = "OK",
+                .index_type = config.index_type,
+                .vector_count = index.size()},
+               std::span<const LogField>(fields).first(hnsw ? 12 : 7));
 }
 
 }  // namespace
 
 int main(const int argc, char* argv[]) {
+  auto logger = std::make_shared<StructuredLogger>(std::cerr);
+  std::string_view phase = "invalid_configuration";
+  std::string index_type;
+  bool snapshot_requested = false;
+  std::signal(SIGINT, handle_stop_signal);
+  std::signal(SIGTERM, handle_stop_signal);
   try {
     const ServerConfig config = parse_arguments(argc, argv);
+    index_type = config.index_type;
+    snapshot_requested = !config.load_index_path.empty();
+    phase = "index_initialization_failed";
+    auto index = make_index(config, *logger);
+    log_config(config, *index, *logger);
     auto store = std::make_shared<fast_vector::VectorStore>(
-        make_index(config), config.maximum_batch_size, config.read_only);
-    fast_vector::service::VectorSearchService vector_service(store, config.index_type);
+        std::move(index), config.maximum_batch_size, config.read_only);
+    fast_vector::service::VectorSearchService vector_service(store, config.index_type, logger);
+    if (stop_requested.load(std::memory_order_relaxed) != 0) {
+      logger->write({.event = "shutdown_completed",
+                     .status = "OK",
+                     .index_type = config.index_type,
+                     .vector_count = store->stats().index_size},
+                    {{"reason", shutdown_reason()}});
+      return 0;
+    }
 
+    phase = "listen_failed";
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
     int selected_port = 0;
@@ -207,47 +308,62 @@ int main(const int argc, char* argv[]) {
       throw std::runtime_error("failed to start gRPC server on " + config.address);
     }
 
-    std::signal(SIGINT, handle_stop_signal);
-    std::signal(SIGTERM, handle_stop_signal);
 #if defined(SIGHUP)
     if (config.reload_on_sighup) {
       std::signal(SIGHUP, handle_reload_signal);
     }
 #endif
-    std::thread shutdown_monitor([&config, &server, &store] {
-      while (stop_requested == 0) {
+    std::jthread shutdown_monitor([&config, &server, &store, &logger](std::stop_token stop) {
+      while (stop_requested.load(std::memory_order_relaxed) == 0 && !stop.stop_requested()) {
 #if defined(SIGHUP)
-        if (reload_requested != 0) {
-          reload_requested = 0;
+        if (reload_requested.exchange(0, std::memory_order_relaxed) != 0) {
           try {
-            auto replacement = std::make_unique<fast_vector::FlatIndex>(
-                fast_vector::load_flat_index(config.load_index_path, config.kernel));
+            auto replacement = load_snapshot(config, *logger, "reload", store->stats().index_size);
             const std::size_t count = replacement->size();
             const std::size_t dimension = replacement->dimension();
             store->replace_index(std::move(replacement));
-            std::cout << "Reloaded FlatIndex snapshot from " << config.load_index_path
-                      << " (dimension " << dimension << ", vectors " << count << ")\n";
-          } catch (const std::exception& error) {
-            std::cerr << "Snapshot reload failed; continuing with the current index: "
-                      << error.what() << '\n';
+            logger->write({.event = "index_replaced",
+                           .status = "OK",
+                           .index_type = config.index_type,
+                           .vector_count = count},
+                          {{"dimension", static_cast<std::uint64_t>(dimension)}});
+          } catch (...) {
+            // load_snapshot already logged a sanitized failure; retain the current index.
           }
         }
 #endif
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
+      logger->write({.event = "shutdown_requested", .index_type = config.index_type},
+                    {{"reason", shutdown_reason()}});
       server->Shutdown();
     });
 
     const fast_vector::StoreStats stats = store->stats();
-    std::cout << "fast-vector gRPC server listening on " << config.address << " (selected port "
-              << selected_port << ", index " << config.index_type << ", dimension "
-              << stats.dimension << ", vectors " << stats.index_size << ", read-only "
-              << (stats.read_only ? "true" : "false") << ")\n";
+    logger->write({.event = "server_started",
+                   .status = "OK",
+                   .index_type = config.index_type,
+                   .vector_count = stats.index_size},
+                  {{"selected_port", static_cast<std::uint64_t>(selected_port)}});
+    phase = "serving_failed";
     server->Wait();
     shutdown_monitor.join();
+    vector_service.log_rpc_summary();
+    logger->write({.event = "shutdown_completed",
+                   .status = "OK",
+                   .index_type = config.index_type,
+                   .vector_count = store->stats().index_size},
+                  {{"reason", shutdown_reason()}});
   } catch (const std::exception& error) {
-    std::cerr << "Server failed: " << error.what() << '\n';
-    print_usage();
+    logger->write({.severity = "ERROR",
+                   .event = phase == "serving_failed" ? "server_failed" : "startup_failed",
+                   .status = dynamic_cast<const std::invalid_argument*>(&error)
+                                 ? "INVALID_ARGUMENT"
+                                 : (snapshot_requested && phase == "index_initialization_failed"
+                                        ? "FAILED_PRECONDITION"
+                                        : "INTERNAL"),
+                   .index_type = index_type},
+                  {{"reason", phase}, {"usage", std::string_view(kUsage)}});
     return 1;
   }
   return 0;

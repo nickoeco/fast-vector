@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "fast_vector/flat_index.h"
@@ -15,10 +16,14 @@ namespace {
 
 class GrpcServiceTest : public ::testing::Test {
  protected:
+  virtual std::unique_ptr<fast_vector::VectorIndex> create_index() {
+    return std::make_unique<fast_vector::FlatIndex>(2);
+  }
   void SetUp() override {
-    auto index = std::make_unique<fast_vector::FlatIndex>(2);
+    auto index = create_index();
     store_ = std::make_shared<fast_vector::VectorStore>(std::move(index), 2);
-    service_ = std::make_unique<fast_vector::service::VectorSearchService>(store_, "flat");
+    logger_ = std::make_shared<fast_vector::service::StructuredLogger>(logs_);
+    service_ = std::make_unique<fast_vector::service::VectorSearchService>(store_, "flat", logger_);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -43,6 +48,8 @@ class GrpcServiceTest : public ::testing::Test {
     }
   }
 
+  std::ostringstream logs_;
+  std::shared_ptr<fast_vector::service::StructuredLogger> logger_;
   std::shared_ptr<fast_vector::VectorStore> store_;
   std::unique_ptr<fast_vector::service::VectorSearchService> service_;
   std::unique_ptr<grpc::Server> server_;
@@ -170,6 +177,64 @@ TEST_F(GrpcServiceTest, MapsInputAndResourceErrorsToGrpcStatuses) {
   const grpc::Status batch_status = stub_->BatchAdd(&batch_context, batch, &batch_response);
   EXPECT_EQ(batch_status.error_code(), grpc::StatusCode::RESOURCE_EXHAUSTED);
   EXPECT_EQ(store_->stats().index_size, 0U);
+  service_->log_rpc_summary();
+  EXPECT_NE(logs_.str().find("\"event\":\"rpc_error_summary\""), std::string::npos);
+  EXPECT_NE(logs_.str().find("\"status\":\"INVALID_ARGUMENT\""), std::string::npos);
+  EXPECT_NE(logs_.str().find("\"status\":\"RESOURCE_EXHAUSTED\""), std::string::npos);
+  EXPECT_NE(logs_.str().find("\"failed_rpcs\":2"), std::string::npos);
+}
+
+TEST_F(GrpcServiceTest, LoggingFailureDoesNotChangeSuccessfulRpc) {
+  logs_.setstate(std::ios::badbit);
+  fast_vector::v1::AddVectorRequest request;
+  request.mutable_vector()->set_id(42);
+  request.mutable_vector()->add_values(1.0F);
+  request.mutable_vector()->add_values(0.0F);
+  fast_vector::v1::AddVectorResponse response;
+  grpc::ClientContext context;
+  const auto status = stub_->AddVector(&context, request, &response);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(response.index_size(), 1U);
+  EXPECT_EQ(logger_->dropped_records(), 1U);
+  logs_.clear();
+  service_->log_rpc_summary();
+  EXPECT_NE(logs_.str().find("\"completed_rpcs\":1"), std::string::npos);
+  EXPECT_NE(logs_.str().find("\"dropped_log_records\":1"), std::string::npos);
+}
+
+class SensitiveFailureIndex final : public fast_vector::VectorIndex {
+ public:
+  void add(fast_vector::VectorId, std::span<const float>) override {
+    throw std::runtime_error("PRIVATE_DOCUMENT_CONTENT");
+  }
+  std::vector<fast_vector::SearchResult> search(std::span<const float>,
+                                                std::size_t) const override {
+    throw std::runtime_error("PRIVATE_DOCUMENT_CONTENT");
+  }
+  std::size_t size() const noexcept override { return 1; }
+  std::size_t dimension() const noexcept override { return 2; }
+};
+
+class InternalFailureGrpcTest : public GrpcServiceTest {
+ protected:
+  std::unique_ptr<fast_vector::VectorIndex> create_index() override {
+    return std::make_unique<SensitiveFailureIndex>();
+  }
+};
+
+TEST_F(InternalFailureGrpcTest, LogsInternalStatusWithoutExceptionMessage) {
+  fast_vector::v1::SearchRequest request;
+  request.add_query(1.0F);
+  request.add_query(0.0F);
+  request.set_k(1);
+  fast_vector::v1::SearchResponse response;
+  grpc::ClientContext context;
+  const auto status = stub_->Search(&context, request, &response);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
+  EXPECT_EQ(logs_.str().find("PRIVATE_DOCUMENT_CONTENT"), std::string::npos);
+  EXPECT_NE(logs_.str().find("\"status\":\"INTERNAL\""), std::string::npos);
+  service_->log_rpc_summary();
+  EXPECT_NE(logs_.str().find("\"failed_rpcs\":1"), std::string::npos);
 }
 
 TEST_F(GrpcServiceTest, HonorsExpiredDeadline) {

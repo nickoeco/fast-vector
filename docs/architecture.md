@@ -106,6 +106,16 @@ preserve the current in-memory index. Automatic saving and HNSW hot reload are n
 The default container and Kubernetes commands still start with an empty index unless an operator
 mounts a snapshot and supplies the loading arguments.
 
+## Structured service logs
+
+The optional gRPC target owns a shared JSON Lines writer on stderr. Application handlers emit
+one completion record with a process-local request ID, method, returned status, elapsed time,
+index type, and observed live vector count. Atomic counters summarize handler outcomes after
+shutdown drains requests. Lifecycle records cover effective startup configuration, snapshot
+loading and reload, startup failure, and shutdown reason. Signal handlers only update lock-free
+flags; normal threads perform logging. Payloads and raw exception messages are never logged.
+See [logging](logging.md) for timing, privacy, collection, and failure semantics.
+
 ## Deployment boundary
 
 The multi-stage Docker build produces a non-root runtime image. Kubernetes uses native gRPC
