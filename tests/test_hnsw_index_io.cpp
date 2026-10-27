@@ -143,8 +143,15 @@ std::vector<EdgeLocation> locate_edges(const std::vector<std::uint8_t>& bytes) {
 
 std::size_t graph_end(const std::vector<std::uint8_t>& bytes) {
   const auto edges = locate_edges(bytes);
+  if (edges.empty()) {
+    return kHeaderSize;
+  }
   const auto& last = edges.back();
   return last.neighbor_offset + static_cast<std::size_t>(last.degree) * 4;
+}
+
+std::size_t rng_offset(const std::vector<std::uint8_t>& bytes) {
+  return graph_end(bytes) + 8 + get_integer(bytes, 32, 8);
 }
 
 TEST(HnswIndexIoTest, RoundTripPreservesQueriesConfigurationAndGraphStatistics) {
@@ -164,6 +171,8 @@ TEST(HnswIndexIoTest, RoundTripPreservesQueriesConfigurationAndGraphStatistics) 
     const auto before = original.stats();
     const auto after = loaded.stats();
     EXPECT_EQ(after.node_count, before.node_count);
+    EXPECT_EQ(after.live_count, before.live_count);
+    EXPECT_EQ(after.deleted_count, before.deleted_count);
     EXPECT_EQ(after.max_level, before.max_level);
     EXPECT_EQ(after.directed_edge_count, before.directed_edge_count);
     EXPECT_EQ(after.maximum_node_degree, before.maximum_node_degree);
@@ -201,6 +210,8 @@ TEST(HnswIndexIoTest, RestoredRngStateReproducesFutureInsertions) {
                                fast_vector::HnswNeighborSelection::Heuristic}) {
     TemporaryIndexFile file;
     auto original = make_index(selection);
+    ASSERT_TRUE(original.erase(1));
+    ASSERT_TRUE(original.erase(50));
     fast_vector::save_hnsw_index(original, file.path());
     auto loaded = fast_vector::load_hnsw_index(file.path());
     for (fast_vector::VectorId id = 101; id <= 140; ++id) {
@@ -229,15 +240,189 @@ TEST(HnswIndexIoTest, LoadsLegacyVersionOneSnapshot) {
   write_bytes(file.path(), bytes);
   const auto loaded = fast_vector::load_hnsw_index(file.path());
   EXPECT_EQ(loaded.stats().directed_edge_count, original.stats().directed_edge_count);
+  EXPECT_EQ(loaded.stats().live_count, 100U);
+  EXPECT_EQ(loaded.stats().deleted_count, 0U);
   EXPECT_EQ(loaded.search(std::vector<float>{1, 2, 3}, 10),
             original.search(std::vector<float>{1, 2, 3}, 10));
+}
+
+TEST(HnswIndexIoTest, LoadsLegacyVersionTwoWithRngContinuationAndAllNodesLive) {
+  TemporaryIndexFile file;
+  auto original = make_index(fast_vector::HnswNeighborSelection::Simple);
+  fast_vector::save_hnsw_index(original, file.path());
+  auto bytes = read_bytes(file.path());
+  const auto begin = graph_end(bytes);
+  const auto end = rng_offset(bytes);
+  bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(begin),
+              bytes.begin() + static_cast<std::ptrdiff_t>(end));
+  put_integer(bytes, 8, 4, 2);
+  put_integer(bytes, 96, 8, bytes.size() - kHeaderSize);
+  update_checksum(bytes);
+  write_bytes(file.path(), bytes);
+  auto loaded = fast_vector::load_hnsw_index(file.path());
+  EXPECT_EQ(loaded.size(), 100U);
+  EXPECT_EQ(loaded.stats().deleted_count, 0U);
+  original.add(101, std::vector<float>{2, 5, 7});
+  loaded.add(101, std::vector<float>{2, 5, 7});
+  fast_vector::save_hnsw_index(original, file.path());
+  const auto expected = read_bytes(file.path());
+  fast_vector::save_hnsw_index(loaded, file.path());
+  EXPECT_EQ(read_bytes(file.path()), expected);
+}
+
+TEST(HnswIndexIoTest, TombstonesRoundTripPreservesGraphEntryAndQueries) {
+  TemporaryIndexFile file;
+  auto original = make_index(fast_vector::HnswNeighborSelection::Heuristic);
+  fast_vector::save_hnsw_index(original, file.path());
+  const auto before_bytes = read_bytes(file.path());
+  const auto entry = get_integer(before_bytes, 88, 8);
+  const auto entry_id = get_integer(before_bytes, kHeaderSize + entry * 8, 8);
+  ASSERT_TRUE(original.erase(entry_id));
+  for (fast_vector::VectorId id = 3; id <= 100; id += 3) {
+    if (id != entry_id) {
+      ASSERT_TRUE(original.erase(id));
+    }
+  }
+  fast_vector::save_hnsw_index(original, file.path());
+  const auto after_bytes = read_bytes(file.path());
+  ASSERT_EQ(after_bytes.size(), before_bytes.size());
+  EXPECT_EQ(get_integer(after_bytes, 88, 8), entry);
+  // Deletion must not alter IDs, vectors, levels, edges, or the RNG stream.
+  EXPECT_TRUE(
+      std::equal(before_bytes.begin() + kHeaderSize,
+                 before_bytes.begin() + static_cast<std::ptrdiff_t>(graph_end(before_bytes)),
+                 after_bytes.begin() + kHeaderSize));
+  EXPECT_TRUE(
+      std::equal(before_bytes.begin() + static_cast<std::ptrdiff_t>(rng_offset(before_bytes)),
+                 before_bytes.end(),
+                 after_bytes.begin() + static_cast<std::ptrdiff_t>(rng_offset(after_bytes))));
+  auto loaded = fast_vector::load_hnsw_index(file.path());
+  EXPECT_EQ(loaded.stats().live_count, original.size());
+  EXPECT_EQ(loaded.stats().deleted_count, original.stats().deleted_count);
+  EXPECT_EQ(loaded.stats().node_count, 100U);
+  EXPECT_EQ(loaded.stats().directed_edge_count, original.stats().directed_edge_count);
+  EXPECT_EQ(loaded.stats().max_level, original.stats().max_level);
+  EXPECT_EQ(loaded.stats().maximum_node_degree, original.stats().maximum_node_degree);
+  EXPECT_FALSE(loaded.erase(entry_id));
+  EXPECT_THROW(loaded.add(entry_id, std::vector<float>{1, 2, 3}), std::invalid_argument);
+  for (const auto& query : {std::vector<float>{1, 2, 3}, std::vector<float>{7, 4, 2}}) {
+    EXPECT_EQ(loaded.search(query, 10), original.search(query, 10));
+  }
+}
+
+TEST(HnswIndexIoTest, AllDeletedSnapshotCanLoadAndAcceptNewIds) {
+  TemporaryIndexFile file;
+  auto index = make_index(fast_vector::HnswNeighborSelection::Simple);
+  for (fast_vector::VectorId id = 1; id <= 100; ++id) {
+    ASSERT_TRUE(index.erase(id));
+  }
+  fast_vector::save_hnsw_index(index, file.path());
+  auto loaded = fast_vector::load_hnsw_index(file.path());
+  EXPECT_EQ(loaded.size(), 0U);
+  EXPECT_EQ(loaded.stats().node_count, 100U);
+  EXPECT_EQ(loaded.stats().deleted_count, 100U);
+  EXPECT_TRUE(loaded.search(std::vector<float>{1, 0, 0}, 10).empty());
+  loaded.add(101, std::vector<float>{1, 0, 0});
+  EXPECT_EQ(loaded.stats().node_count, 101U);
+  EXPECT_EQ(loaded.search(std::vector<float>{1, 0, 0}, 10),
+            (std::vector<fast_vector::SearchResult>{{101, 1}}));
+}
+
+TEST(HnswIndexIoTest, RebuildPreservesVectorBitsSourceAndDeterministicSnapshot) {
+  TemporaryIndexFile source_file;
+  TemporaryIndexFile output_file;
+  auto source = make_index(fast_vector::HnswNeighborSelection::Heuristic);
+  for (fast_vector::VectorId id = 2; id <= 100; id += 2) {
+    ASSERT_TRUE(source.erase(id));
+  }
+  fast_vector::save_hnsw_index(source, source_file.path());
+  const auto source_bytes = read_bytes(source_file.path());
+  const auto rebuilt = source.rebuild(123);
+  fast_vector::save_hnsw_index(rebuilt, output_file.path());
+  const auto rebuilt_bytes = read_bytes(output_file.path());
+  EXPECT_LT(rebuilt_bytes.size(), source_bytes.size());
+  EXPECT_EQ(rebuilt.live_ids(), source.live_ids());
+  const auto count = get_integer(rebuilt_bytes, 32, 8);
+  ASSERT_EQ(count, 50U);
+  for (std::size_t row = 0; row < count; ++row) {
+    const auto id = get_integer(rebuilt_bytes, kHeaderSize + row * 8, 8);
+    const auto source_offset = kHeaderSize + 100 * 8 + (id - 1) * 3 * 4;
+    const auto output_offset = kHeaderSize + count * 8 + row * 3 * 4;
+    for (std::size_t byte = 0; byte < 3 * 4; ++byte) {
+      EXPECT_EQ(rebuilt_bytes.at(output_offset + byte), source_bytes.at(source_offset + byte));
+    }
+  }
+  const auto loaded = fast_vector::load_hnsw_index(output_file.path());
+  EXPECT_EQ(loaded.live_ids(), source.live_ids());
+  EXPECT_EQ(loaded.stats().node_count, 50U);
+  EXPECT_EQ(loaded.stats().deleted_count, 0U);
+  EXPECT_EQ(loaded.search(std::vector<float>{1, 2, 3}, 10),
+            rebuilt.search(std::vector<float>{1, 2, 3}, 10));
+  fast_vector::save_hnsw_index(source.rebuild(123), output_file.path());
+  EXPECT_EQ(read_bytes(output_file.path()), rebuilt_bytes);
+  fast_vector::save_hnsw_index(source, source_file.path());
+  EXPECT_EQ(read_bytes(source_file.path()), source_bytes);
+}
+
+TEST(HnswIndexIoTest, TraversesDeletedEntryAndBridgeToLiveNode) {
+  TemporaryIndexFile file;
+  fast_vector::HnswIndex index({.dimension = 2});
+  index.add(100, std::vector<float>{1, 0});
+  index.add(200, std::vector<float>{-1, 0});
+  index.add(300, std::vector<float>{0, 1});
+  fast_vector::save_hnsw_index(index, file.path());
+  auto bytes = read_bytes(file.path());
+  const auto rng = rng_offset(bytes);
+  const std::vector<std::uint8_t> state(bytes.begin() + static_cast<std::ptrdiff_t>(rng),
+                                        bytes.end());
+  bytes.resize(kHeaderSize + 3 * 8 + 3 * 2 * 4);
+  const auto append = [&](const std::uint64_t value, const std::size_t width) {
+    const auto offset = bytes.size();
+    bytes.resize(offset + width);
+    put_integer(bytes, offset, width, value);
+  };
+  // Controlled layer-zero chain: entry 100 -> bridge 200 -> live 300.
+  for (const auto& neighbors :
+       {std::vector<unsigned>{1}, std::vector<unsigned>{0, 2}, std::vector<unsigned>{1}}) {
+    append(0, 4);
+    append(neighbors.size(), 4);
+    for (const auto neighbor : neighbors) {
+      append(neighbor, 4);
+    }
+  }
+  append(3, 8);
+  for (unsigned i = 0; i < 3; ++i) {
+    append(0, 1);
+  }
+  bytes.insert(bytes.end(), state.begin(), state.end());
+  put_integer(bytes, 80, 8, 0);
+  put_integer(bytes, 88, 8, 0);
+  put_integer(bytes, 96, 8, bytes.size() - kHeaderSize);
+  update_checksum(bytes);
+  write_bytes(file.path(), bytes);
+  auto loaded = fast_vector::load_hnsw_index(file.path());
+  ASSERT_TRUE(loaded.erase(100));
+  ASSERT_TRUE(loaded.erase(200));
+  EXPECT_EQ(loaded.search(std::vector<float>{1, 0}, 1, 1),
+            (std::vector<fast_vector::SearchResult>{{300, 0}}));
+}
+
+TEST(HnswIndexIoTest, RejectsInvalidTombstoneFlagsAndCountsWithMatchingChecksum) {
+  const auto index = make_index(fast_vector::HnswNeighborSelection::Simple);
+  TemporaryIndexFile file;
+  fast_vector::save_hnsw_index(index, file.path());
+  const auto offset = graph_end(read_bytes(file.path()));
+  expect_rejected(index, [=](auto& bytes) { put_integer(bytes, offset, 8, 101); });
+  expect_rejected(index, [=](auto& bytes) { put_integer(bytes, offset, 8, 0); });
+  expect_rejected(index, [=](auto& bytes) { bytes.at(offset + 8) = 2; });
+  expect_rejected(index, [=](auto& bytes) { bytes.at(offset + 8) = 1; });
 }
 
 TEST(HnswIndexIoTest, RejectsCorruptRngStateWithMatchingChecksum) {
   const auto index = make_index(fast_vector::HnswNeighborSelection::Simple);
   TemporaryIndexFile file;
   fast_vector::save_hnsw_index(index, file.path());
-  const auto offset = graph_end(read_bytes(file.path()));
+  const auto offset = rng_offset(read_bytes(file.path()));
   expect_rejected(index, [=](auto& bytes) { put_integer(bytes, offset, 4, 0); });
   expect_rejected(index, [=](auto& bytes) { put_integer(bytes, offset, 4, 16385); });
   expect_rejected(index, [=](auto& bytes) { bytes.at(offset + 4) = 'x'; });
@@ -248,7 +433,7 @@ TEST(HnswIndexIoTest, RejectsCorruptHeaderAndPayloadFields) {
   const auto index = make_index(fast_vector::HnswNeighborSelection::Heuristic);
   for (const auto& [offset, width, value] :
        {std::tuple<std::size_t, std::size_t, std::uint64_t>{0, 1, 0},
-        {8, 4, 3},
+        {8, 4, 4},
         {12, 4, 1},
         {16, 4, 0},
         {20, 4, 0},
@@ -263,7 +448,10 @@ TEST(HnswIndexIoTest, RejectsCorruptHeaderAndPayloadFields) {
         {80, 8, 64},
         {88, 8, 100},
         {96, 8, 1}}) {
-    expect_rejected(index, [=](auto& bytes) { put_integer(bytes, offset, width, value); });
+    expect_rejected(index,
+                    [field_offset = offset, field_width = width, field_value = value](auto& bytes) {
+                      put_integer(bytes, field_offset, field_width, field_value);
+                    });
   }
   expect_rejected(index, [](auto& bytes) { put_integer(bytes, kHeaderSize, 8, 2); });
   expect_rejected(index,
@@ -344,7 +532,8 @@ TEST(HnswIndexIoTest, RejectsTruncationTrailingBytesAndChecksumMismatch) {
 #if defined(__linux__)
 TEST(HnswIndexIoTest, PublishesWithoutOverwriteAndAtomicallyReplacesOnRequest) {
   TemporaryIndexFile file;
-  const auto original = make_index(fast_vector::HnswNeighborSelection::Simple);
+  auto original = make_index(fast_vector::HnswNeighborSelection::Simple);
+  ASSERT_TRUE(original.erase(1));
   fast_vector::publish_hnsw_index(original, file.path());
   const auto initial_bytes = read_bytes(file.path());
   EXPECT_EQ(fast_vector::load_hnsw_index(file.path()).size(), original.size());

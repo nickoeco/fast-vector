@@ -125,6 +125,11 @@ if(FAST_VECTOR_BUILD_TESTS)
 
     include(GoogleTest)
     gtest_discover_tests(fast_vector_tests)
+    add_executable(fast_vector_hnsw_failure_tests tests/test_hnsw_allocation_failure.cpp)
+    target_link_libraries(fast_vector_hnsw_failure_tests PRIVATE fast_vector::fast_vector GTest::gtest_main)
+    fast_vector_set_warnings(fast_vector_hnsw_failure_tests)
+    fast_vector_enable_sanitizers(fast_vector_hnsw_failure_tests)
+    gtest_discover_tests(fast_vector_hnsw_failure_tests)
     add_test(
         NAME BuildIndexCliTest
         COMMAND ${CMAKE_COMMAND}

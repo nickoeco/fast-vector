@@ -21,7 +21,8 @@ namespace fast_vector {
 namespace {
 
 constexpr std::array<unsigned char, 8> kMagic{'F', 'V', 'H', 'N', 'S', 'W', '\0', '\0'};
-constexpr std::uint32_t kCurrentVersion = 2;
+constexpr std::uint32_t kCurrentVersion = 3;
+constexpr std::uint32_t kRngStateVersion = 2;
 constexpr std::uint32_t kLegacyVersion = 1;
 constexpr std::uint32_t kHeaderSize = 112;
 constexpr std::uint32_t kMaximumRngStateBytes = 16 * 1024;
@@ -70,7 +71,9 @@ void checksum_integer(std::uint64_t& checksum, UInt value) {
   static_assert(std::is_unsigned_v<UInt>);
   for (std::size_t byte = 0; byte < sizeof(UInt); ++byte) {
     update_checksum(checksum, static_cast<unsigned char>(value & 0xFFU));
-    value >>= 8U;
+    if constexpr (sizeof(UInt) > 1) {
+      value >>= 8U;
+    }
   }
 }
 
@@ -80,7 +83,9 @@ void write_integer(std::ostream& output, UInt value) {
   std::array<char, sizeof(UInt)> bytes{};
   for (char& byte : bytes) {
     byte = static_cast<char>(value & 0xFFU);
-    value >>= 8U;
+    if constexpr (sizeof(UInt) > 1) {
+      value >>= 8U;
+    }
   }
   output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   if (!output) {
@@ -173,7 +178,7 @@ Header read_header(std::istream& input, std::uint64_t& checksum, std::uint64_t& 
   }
   Header header{};
   header.version = read_integer<std::uint32_t>(input, &checksum);
-  if (header.version != kLegacyVersion && header.version != kCurrentVersion) {
+  if (header.version < kLegacyVersion || header.version > kCurrentVersion) {
     fail("unsupported format version");
   }
   if (read_integer<std::uint32_t>(input, &checksum) != kHeaderSize) {
@@ -221,9 +226,14 @@ void validate_header(const Header& header, const std::uintmax_t file_bytes) {
   const std::uint64_t minimum_graph_bytes = checked_multiply(header.count, 8, "graph bytes");
   std::uint64_t minimum_payload =
       checked_add(checked_add(id_bytes, vector_bytes, "payload"), minimum_graph_bytes, "payload");
-  if (header.version == kCurrentVersion) {
+  if (header.version >= kRngStateVersion) {
     minimum_payload =
         checked_add(minimum_payload, sizeof(std::uint32_t) + 1, "RNG state and payload");
+  }
+  if (header.version == kCurrentVersion) {
+    minimum_payload = checked_add(
+        minimum_payload, checked_add(sizeof(std::uint64_t), header.count, "tombstone bytes"),
+        "tombstones and payload");
   }
   if (header.payload_bytes < minimum_payload) {
     fail("payload is too small for the declared dimensions and node count");
@@ -240,9 +250,14 @@ void validate_header(const Header& header, const std::uintmax_t file_bytes) {
       "graph bytes");
   std::uint64_t maximum_payload =
       checked_add(checked_add(id_bytes, vector_bytes, "payload"), maximum_graph_bytes, "payload");
-  if (header.version == kCurrentVersion) {
+  if (header.version >= kRngStateVersion) {
     maximum_payload = checked_add(maximum_payload, sizeof(std::uint32_t) + kMaximumRngStateBytes,
                                   "RNG state and payload");
+  }
+  if (header.version == kCurrentVersion) {
+    maximum_payload = checked_add(
+        maximum_payload, checked_add(sizeof(std::uint64_t), header.count, "tombstone bytes"),
+        "tombstones and payload");
   }
   if (header.payload_bytes > maximum_payload ||
       checked_add(kHeaderSize, header.payload_bytes, "file size") != file_bytes) {
@@ -270,6 +285,11 @@ class HnswIndexSerializer {
         index.config_.max_connections > std::numeric_limits<std::uint32_t>::max() / 2U) {
       fail("in-memory index exceeds snapshot format limits");
     }
+    const auto deleted = static_cast<std::size_t>(std::count_if(
+        index.graph_.begin(), index.graph_.end(), [](const auto& node) { return node.deleted; }));
+    if (deleted != index.deleted_count_) {
+      fail("in-memory tombstone count is inconsistent");
+    }
     std::uint64_t payload_bytes =
         checked_add(checked_multiply(count, sizeof(VectorId), "ID bytes"),
                     checked_multiply(elements, sizeof(float), "vector bytes"), "payload");
@@ -292,6 +312,8 @@ class HnswIndexSerializer {
     }
     payload_bytes =
         checked_add(payload_bytes, sizeof(std::uint32_t) + random_state.size(), "payload");
+    payload_bytes = checked_add(
+        payload_bytes, checked_add(sizeof(std::uint64_t), count, "tombstone bytes"), "payload");
     const Header header{
         kCurrentVersion,
         dimension,
@@ -322,6 +344,10 @@ class HnswIndexSerializer {
         }
       }
     }
+    checksum_integer(checksum, static_cast<std::uint64_t>(index.size()));
+    for (const HnswIndex::Node& node : index.graph_) {
+      checksum_integer(checksum, static_cast<std::uint8_t>(node.deleted));
+    }
     checksum_integer(checksum, static_cast<std::uint32_t>(random_state.size()));
     for (const unsigned char byte : random_state) {
       update_checksum(checksum, byte);
@@ -346,6 +372,10 @@ class HnswIndexSerializer {
           write_integer(output, neighbor);
         }
       }
+    }
+    write_integer(output, static_cast<std::uint64_t>(index.size()));
+    for (const HnswIndex::Node& node : index.graph_) {
+      write_integer(output, static_cast<std::uint8_t>(node.deleted));
     }
     write_integer(output, static_cast<std::uint32_t>(random_state.size()));
     output.write(random_state.data(), static_cast<std::streamsize>(random_state.size()));
@@ -468,6 +498,23 @@ class HnswIndexSerializer {
       }
     }
     if (header.version == kCurrentVersion) {
+      const auto live_count = read_integer<std::uint64_t>(input, &checksum);
+      if (live_count > header.count) {
+        fail("live count exceeds physical node count");
+      }
+      for (auto& node : index.graph_) {
+        const auto flag = read_integer<std::uint8_t>(input, &checksum);
+        if (flag > 1) {
+          fail("invalid tombstone flag");
+        }
+        node.deleted = flag != 0;
+        index.deleted_count_ += flag;
+      }
+      if (index.size() != live_count) {
+        fail("live count does not match tombstone flags");
+      }
+    }
+    if (header.version >= kRngStateVersion) {
       const std::uint32_t state_length = read_integer<std::uint32_t>(input, &checksum);
       const auto position = input.tellg();
       const std::uint64_t file_end = checked_add(kHeaderSize, header.payload_bytes, "file size");

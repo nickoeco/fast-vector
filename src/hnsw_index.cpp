@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <utility>
@@ -21,7 +22,7 @@ HnswConfig validate_config(HnswConfig config) {
   if (config.max_connections < 2) {
     throw std::invalid_argument("HNSW max_connections must be at least two");
   }
-  if (config.max_connections > std::numeric_limits<std::size_t>::max() / 2) {
+  if (config.max_connections > std::numeric_limits<std::uint32_t>::max() / 2U) {
     throw std::invalid_argument("HNSW max_connections is too large");
   }
   if (config.ef_construction < config.max_connections) {
@@ -39,6 +40,79 @@ HnswConfig validate_config(HnswConfig config) {
 
 }  // namespace
 
+// Capture only adjacency lists touched by this insertion. Rollback never allocates.
+class HnswIndex::InsertionTransaction {
+ public:
+  explicit InsertionTransaction(HnswIndex& index)
+      : index_(index),
+        node_count_(index.ids_.size()),
+        vector_count_(index.vectors_.size()),
+        random_(index.random_),
+        entry_(index.entry_point_),
+        level_(index.max_level_) {}
+
+  ~InsertionTransaction() noexcept {
+    if (committed_) {
+      return;
+    }
+    for (auto& backup : backups_) {
+      index_.graph_[backup.node].levels[backup.level].swap(backup.neighbors);
+    }
+    if (inserted_id_) {
+      index_.id_to_node_.erase(*inserted_id_);
+    }
+    while (index_.graph_.size() > node_count_) {
+      index_.graph_.pop_back();
+    }
+    index_.ids_.resize(node_count_);
+    index_.vectors_.resize(vector_count_);
+    index_.random_ = random_;
+    index_.entry_point_ = entry_;
+    index_.max_level_ = level_;
+  }
+
+  InsertionTransaction(const InsertionTransaction&) = delete;
+  InsertionTransaction& operator=(const InsertionTransaction&) = delete;
+
+  void remember(const NodeIndex node, const std::size_t level) {
+    if (node >= node_count_) {
+      return;  // New-node storage is discarded wholesale on rollback.
+    }
+    for (const auto& backup : backups_) {
+      if (backup.node == node && backup.level == level) {
+        return;
+      }
+    }
+    backups_.push_back({node, level, index_.graph_[node].levels[level]});
+  }
+
+  void insert_id(const VectorId id, const NodeIndex node) {
+    const auto [position, inserted] = index_.id_to_node_.emplace(id, node);
+    if (!inserted) {
+      throw std::invalid_argument("vector ID already exists");
+    }
+    inserted_id_ = position;
+  }
+
+  void commit() noexcept { committed_ = true; }
+
+ private:
+  struct Backup {
+    NodeIndex node;
+    std::size_t level;
+    std::vector<NodeIndex> neighbors;
+  };
+  HnswIndex& index_;
+  std::size_t node_count_;
+  std::size_t vector_count_;
+  std::mt19937_64 random_;
+  NodeIndex entry_;
+  std::size_t level_;
+  std::vector<Backup> backups_;
+  std::optional<std::unordered_map<VectorId, NodeIndex>::iterator> inserted_id_;
+  bool committed_ = false;
+};
+
 HnswIndex::HnswIndex(HnswConfig config)
     : config_(validate_config(config)),
       dot_product_(detail::resolve_dot_product_kernel(config_.kernel)),
@@ -51,21 +125,30 @@ void HnswIndex::add(const VectorId id, const std::span<const float> vector) {
   if (id_to_node_.contains(id)) {
     throw std::invalid_argument("vector ID already exists");
   }
-  if (size() >= static_cast<std::size_t>(std::numeric_limits<NodeIndex>::max())) {
+  if (ids_.size() >= static_cast<std::size_t>(std::numeric_limits<NodeIndex>::max())) {
     throw std::length_error("HNSW node index capacity exceeded");
   }
 
   std::vector<float> normalized = normalize_l2(vector);
+  insert_normalized(id, normalized);
+}
+
+void HnswIndex::insert_normalized(const VectorId id, const std::span<const float> normalized) {
+  if (config_.dimension > vectors_.max_size() - vectors_.size()) {
+    throw std::length_error("HNSW vector storage capacity exceeded");
+  }
+  InsertionTransaction transaction(*this);
   const std::size_t level = random_level();
-  const NodeIndex new_node = static_cast<NodeIndex>(size());
+  const NodeIndex new_node = static_cast<NodeIndex>(ids_.size());
 
   if (graph_.empty()) {
     vectors_.insert(vectors_.end(), normalized.begin(), normalized.end());
     ids_.push_back(id);
     graph_.push_back(Node{std::vector<std::vector<NodeIndex>>(level + 1)});
-    id_to_node_.emplace(id, new_node);
+    transaction.insert_id(id, new_node);
     entry_point_ = new_node;
     max_level_ = level;
+    transaction.commit();
     return;
   }
 
@@ -89,13 +172,14 @@ void HnswIndex::add(const VectorId id, const std::span<const float> vector) {
   vectors_.insert(vectors_.end(), normalized.begin(), normalized.end());
   ids_.push_back(id);
   graph_.push_back(Node{std::move(connection_plan)});
-  id_to_node_.emplace(id, new_node);
+  transaction.insert_id(id, new_node);
 
   for (std::size_t current_level = 0; current_level <= first_connected_level; ++current_level) {
     const std::vector<NodeIndex> neighbors = graph_[new_node].levels[current_level];
     for (const NodeIndex neighbor : neighbors) {
+      transaction.remember(neighbor, current_level);
       graph_[neighbor].levels[current_level].push_back(new_node);
-      prune_neighbors(neighbor, current_level);
+      prune_neighbors(neighbor, current_level, transaction);
     }
   }
 
@@ -103,6 +187,43 @@ void HnswIndex::add(const VectorId id, const std::span<const float> vector) {
     entry_point_ = new_node;
     max_level_ = level;
   }
+  transaction.commit();
+}
+
+std::vector<VectorId> HnswIndex::live_ids() const {
+  std::vector<VectorId> result;
+  result.reserve(size());
+  for (std::size_t node = 0; node < ids_.size(); ++node) {
+    if (!graph_[node].deleted) {
+      result.push_back(ids_[node]);
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+HnswIndex HnswIndex::rebuild(const std::uint64_t random_seed) const {
+  auto config = config_;
+  config.random_seed = random_seed;
+  HnswIndex result(config);
+  for (const auto id : live_ids()) {
+    const auto node = id_to_node_.at(id);
+    result.insert_normalized(
+        id,
+        std::span<const float>(vectors_.data() + static_cast<std::size_t>(node) * config_.dimension,
+                               config_.dimension));
+  }
+  return result;
+}
+
+bool HnswIndex::erase(const VectorId id) {
+  const auto position = id_to_node_.find(id);
+  if (position == id_to_node_.end() || graph_[position->second].deleted) {
+    return false;
+  }
+  graph_[position->second].deleted = true;
+  ++deleted_count_;
+  return true;
 }
 
 std::vector<SearchResult> HnswIndex::search(const std::span<const float> query,
@@ -123,7 +244,7 @@ std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, 
   }
 
   const std::vector<float> normalized = normalize_l2(query);
-  if (graph_.empty()) {
+  if (size() == 0) {
     return {};
   }
 
@@ -134,7 +255,7 @@ std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, 
 
   const std::size_t result_count = std::min(k, size());
   const std::size_t effective_ef = std::max(result_count, ef_search);
-  std::vector<Candidate> candidates = search_layer(normalized, entry, effective_ef, 0);
+  std::vector<Candidate> candidates = search_layer(normalized, entry, effective_ef, 0, true);
   if (candidates.size() > result_count) {
     candidates.resize(result_count);
   }
@@ -147,14 +268,14 @@ std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, 
   return results;
 }
 
-std::size_t HnswIndex::size() const noexcept { return ids_.size(); }
+std::size_t HnswIndex::size() const noexcept { return ids_.size() - deleted_count_; }
 
 std::size_t HnswIndex::dimension() const noexcept { return config_.dimension; }
 
 const HnswConfig& HnswIndex::config() const noexcept { return config_; }
 
 HnswStats HnswIndex::stats() const noexcept {
-  HnswStats result{size(), graph_.empty() ? 0 : max_level_, 0, 0};
+  HnswStats result{ids_.size(), graph_.empty() ? 0 : max_level_, 0, 0, size(), deleted_count_};
   for (const Node& node : graph_) {
     std::size_t degree = 0;
     for (const std::vector<NodeIndex>& neighbors : node.levels) {
@@ -209,7 +330,8 @@ HnswIndex::NodeIndex HnswIndex::greedy_search_layer(const std::span<const float>
 std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const float> query,
                                                           const NodeIndex entry,
                                                           const std::size_t ef,
-                                                          const std::size_t level) const {
+                                                          const std::size_t level,
+                                                          const bool live_only) const {
   const auto better = [this](const Candidate& lhs, const Candidate& rhs) {
     return is_better(lhs, rhs);
   };
@@ -218,11 +340,13 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const 
   };
   std::priority_queue<Candidate, std::vector<Candidate>, decltype(worse)> pending(worse);
   std::priority_queue<Candidate, std::vector<Candidate>, decltype(better)> best(better);
-  std::vector<bool> visited(size(), false);
+  std::vector<bool> visited(graph_.size(), false);
 
   const Candidate initial{entry, similarity(query, entry)};
   pending.push(initial);
-  best.push(initial);
+  if (!live_only || !graph_[entry].deleted) {
+    best.push(initial);
+  }
   visited[entry] = true;
 
   while (!pending.empty()) {
@@ -240,9 +364,13 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const 
       const Candidate candidate{neighbor, similarity(query, neighbor)};
       if (best.size() < ef || is_better(candidate, best.top())) {
         pending.push(candidate);
-        best.push(candidate);
-        if (best.size() > ef) {
-          best.pop();
+        // Tombstones can route to live nodes but must not consume result slots.
+        // Construction searches include them so insertion can reuse existing graph routes.
+        if (!live_only || !graph_[neighbor].deleted) {
+          best.push(candidate);
+          if (best.size() > ef) {
+            best.pop();
+          }
         }
       }
     }
@@ -307,7 +435,8 @@ std::size_t HnswIndex::maximum_connections(const std::size_t level) const noexce
   return level == 0 ? config_.max_connections * 2 : config_.max_connections;
 }
 
-void HnswIndex::prune_neighbors(const NodeIndex node, const std::size_t level) {
+void HnswIndex::prune_neighbors(const NodeIndex node, const std::size_t level,
+                                InsertionTransaction& transaction) {
   std::vector<NodeIndex>& neighbors = graph_[node].levels[level];
   const std::size_t maximum_count = maximum_connections(level);
   if (neighbors.size() <= maximum_count) {
@@ -328,6 +457,7 @@ void HnswIndex::prune_neighbors(const NodeIndex node, const std::size_t level) {
   for (const NodeIndex previous_neighbor : neighbors) {
     if (std::find(selected.begin(), selected.end(), previous_neighbor) == selected.end()) {
       const NodeIndex removed_neighbor = previous_neighbor;
+      transaction.remember(removed_neighbor, level);
       std::vector<NodeIndex>& reverse = graph_[removed_neighbor].levels[level];
       std::erase(reverse, node);
     }

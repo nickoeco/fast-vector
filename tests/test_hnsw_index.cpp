@@ -40,6 +40,11 @@ TEST(HnswIndexTest, RejectsInvalidConfiguration) {
   config = test_config();
   config.neighbor_selection = static_cast<fast_vector::HnswNeighborSelection>(99);
   EXPECT_THROW((void)fast_vector::HnswIndex{config}, std::invalid_argument);
+
+  config = test_config();
+  config.max_connections = std::numeric_limits<std::uint32_t>::max() / 2U + 1U;
+  config.ef_construction = config.max_connections;
+  EXPECT_THROW((void)fast_vector::HnswIndex{config}, std::invalid_argument);
 }
 
 TEST(HnswIndexTest, AddsAndFindsOneVector) {
@@ -87,9 +92,9 @@ TEST(HnswIndexTest, HandlesSearchBoundaries) {
   fast_vector::HnswIndex empty(test_config());
   EXPECT_TRUE(empty.search(std::vector<float>{1.0F, 0.0F}, 5).empty());
   EXPECT_TRUE(empty.search(std::vector<float>{}, 0).empty());
-  EXPECT_THROW(empty.search(std::vector<float>{1.0F}, 1), std::invalid_argument);
-  EXPECT_THROW(empty.search(std::vector<float>{0.0F, 0.0F}, 1), std::invalid_argument);
-  EXPECT_THROW(empty.search(std::vector<float>{1.0F, 0.0F}, 1, 0), std::invalid_argument);
+  EXPECT_THROW((void)empty.search(std::vector<float>{1.0F}, 1), std::invalid_argument);
+  EXPECT_THROW((void)empty.search(std::vector<float>{0.0F, 0.0F}, 1), std::invalid_argument);
+  EXPECT_THROW((void)empty.search(std::vector<float>{1.0F, 0.0F}, 1, 0), std::invalid_argument);
 
   fast_vector::HnswIndex index(test_config());
   index.add(1, std::vector<float>{1.0F, 0.0F});
@@ -140,6 +145,149 @@ TEST(HnswIndexTest, RepeatedSearchDoesNotChangeGraph) {
   EXPECT_EQ(before.node_count, after.node_count);
   EXPECT_EQ(before.max_level, after.max_level);
   EXPECT_EQ(before.directed_edge_count, after.directed_edge_count);
+}
+
+TEST(HnswIndexTest, MarksDeletionWithoutChangingGraphAndReservesId) {
+  fast_vector::HnswIndex index(test_config());
+  const auto maximum_id = std::numeric_limits<fast_vector::VectorId>::max();
+  EXPECT_FALSE(index.erase(0));
+  index.add(0, std::vector<float>{1, 0});
+  index.add(maximum_id, std::vector<float>{0, 1});
+  index.add(7, std::vector<float>{-1, 0});
+  const auto before = index.stats();
+  ASSERT_TRUE(index.erase(0));
+  EXPECT_FALSE(index.erase(0));
+  EXPECT_FALSE(index.erase(123));
+  EXPECT_EQ(index.size(), 2U);
+  const auto after = index.stats();
+  EXPECT_EQ(after.node_count, before.node_count);
+  EXPECT_EQ(after.live_count, 2U);
+  EXPECT_EQ(after.deleted_count, 1U);
+  EXPECT_EQ(after.directed_edge_count, before.directed_edge_count);
+  EXPECT_EQ(after.max_level, before.max_level);
+  EXPECT_EQ(after.maximum_node_degree, before.maximum_node_degree);
+  EXPECT_EQ(index.search(std::vector<float>{1, 0}, 10),
+            (std::vector<fast_vector::SearchResult>{{maximum_id, 0}, {7, -1}}));
+  EXPECT_THROW(index.add(0, std::vector<float>{1, 1}), std::invalid_argument);
+  ASSERT_TRUE(index.erase(maximum_id));
+  EXPECT_FALSE(index.erase(maximum_id));
+  EXPECT_EQ(index.search(std::vector<float>{1, 0}, 1),
+            (std::vector<fast_vector::SearchResult>{{7, -1}}));
+}
+
+TEST(HnswIndexTest, DeletionKeepsScoreAndIdOrdering) {
+  fast_vector::HnswIndex index(test_config());
+  for (const auto id : {30U, 20U, 10U}) {
+    index.add(id, std::vector<float>{1, 0});
+  }
+  index.add(40, std::vector<float>{-1, 0});
+  ASSERT_TRUE(index.erase(30));
+  EXPECT_EQ(index.search(std::vector<float>{1, 0}, 10, 1),
+            (std::vector<fast_vector::SearchResult>{{10, 1}, {20, 1}, {40, -1}}));
+  EXPECT_TRUE(index.search(std::vector<float>{}, 0).empty());
+}
+
+TEST(HnswIndexTest, AllDeletedIndexAcceptsNewIdsAtNewPhysicalPositions) {
+  fast_vector::HnswIndex index(test_config());
+  index.add(10, std::vector<float>{1, 0});
+  index.add(20, std::vector<float>{0, 1});
+  ASSERT_TRUE(index.erase(10));
+  ASSERT_TRUE(index.erase(20));
+  EXPECT_EQ(index.size(), 0U);
+  EXPECT_EQ(index.stats().node_count, 2U);
+  EXPECT_TRUE(index.search(std::vector<float>{1, 0}, 10).empty());
+  EXPECT_THROW((void)index.search(std::vector<float>{0, 0}, 1), std::invalid_argument);
+  EXPECT_THROW((void)index.search(std::vector<float>{1}, 1), std::invalid_argument);
+  EXPECT_THROW((void)index.search(std::vector<float>{1, 0}, 1, 0), std::invalid_argument);
+  index.add(30, std::vector<float>{1, 0});
+  EXPECT_EQ(index.stats().node_count, 3U);
+  EXPECT_EQ(index.stats().deleted_count, 2U);
+  EXPECT_EQ(index.size(), 1U);
+  EXPECT_EQ(index.search(std::vector<float>{1, 0}, 10),
+            (std::vector<fast_vector::SearchResult>{{30, 1}}));
+  index.add(40, std::vector<float>{0, 1});
+  ASSERT_TRUE(index.erase(30));
+  EXPECT_EQ(index.search(std::vector<float>{0, 1}, 10),
+            (std::vector<fast_vector::SearchResult>{{40, 1}}));
+}
+
+TEST(HnswIndexTest, TombstoneSearchMatchesLiveFlatGroundTruthOnConnectedGraph) {
+  for (const auto selection : {fast_vector::HnswNeighborSelection::Simple,
+                               fast_vector::HnswNeighborSelection::Heuristic}) {
+    auto config = test_config(5);
+    config.max_connections = 32;
+    config.ef_construction = 64;
+    config.neighbor_selection = selection;
+    fast_vector::HnswIndex index(config);
+    fast_vector::FlatIndex truth(config.dimension);
+    // All 48 nodes fit in each base-layer adjacency list, giving a connected test graph.
+    for (fast_vector::VectorId id = 0; id < 48; ++id) {
+      std::vector<float> vector(config.dimension);
+      for (std::size_t d = 0; d < vector.size(); ++d) {
+        vector[d] = static_cast<float>((id * (d + 3)) % 31 + 1);
+      }
+      index.add(id, vector);
+      truth.add(id, vector);
+    }
+    for (fast_vector::VectorId id = 0; id < 48; ++id) {
+      if (id % 4 != 0) {
+        ASSERT_TRUE(index.erase(id));
+        ASSERT_TRUE(truth.erase(id));
+      }
+    }
+    for (std::size_t q = 0; q < 15; ++q) {
+      std::vector<float> query(config.dimension);
+      for (std::size_t d = 0; d < query.size(); ++d) {
+        query[d] = static_cast<float>(((q + 2) * (d + 5)) % 29 + 1);
+      }
+      for (const auto k : {1U, 10U, 100U}) {
+        EXPECT_EQ(index.search(query, k, 1), truth.search(query, k));
+      }
+    }
+    EXPECT_EQ(index.stats().live_count, 12U);
+    EXPECT_EQ(index.stats().deleted_count, 36U);
+  }
+}
+
+TEST(HnswIndexTest, RebuildKeepsLiveIdsAndDropsReservationsOfDeletedIds) {
+  for (const auto selection : {fast_vector::HnswNeighborSelection::Simple,
+                               fast_vector::HnswNeighborSelection::Heuristic}) {
+    auto config = test_config();
+    config.neighbor_selection = selection;
+    fast_vector::HnswIndex source(config);
+    source.add(30, std::vector<float>{1, 0});
+    source.add(10, std::vector<float>{0, 1});
+    source.add(20, std::vector<float>{-1, 0});
+    ASSERT_TRUE(source.erase(10));
+    auto rebuilt = source.rebuild(123);
+    EXPECT_EQ(rebuilt.live_ids(), (std::vector<fast_vector::VectorId>{20, 30}));
+    EXPECT_EQ(rebuilt.stats().node_count, 2U);
+    EXPECT_EQ(rebuilt.stats().deleted_count, 0U);
+    EXPECT_EQ(rebuilt.config().random_seed, 123U);
+    EXPECT_EQ(rebuilt.config().neighbor_selection, selection);
+    EXPECT_EQ(rebuilt.config().kernel, config.kernel);
+    EXPECT_EQ(rebuilt.search(std::vector<float>{1, 0}, 10),
+              (std::vector<fast_vector::SearchResult>{{30, 1}, {20, -1}}));
+    EXPECT_EQ(source.stats().node_count, 3U);
+    EXPECT_EQ(source.stats().deleted_count, 1U);
+    EXPECT_THROW(source.add(10, std::vector<float>{1, 1}), std::invalid_argument);
+    rebuilt.add(10, std::vector<float>{1, 1});
+    EXPECT_EQ(rebuilt.size(), 3U);
+  }
+}
+
+TEST(HnswIndexTest, EmptyAndAllDeletedRebuildsStartEmptyAndAcceptNewVectors) {
+  fast_vector::HnswIndex source(test_config());
+  EXPECT_EQ(source.rebuild(42).stats().node_count, 0U);
+  source.add(7, std::vector<float>{1, 0});
+  ASSERT_TRUE(source.erase(7));
+  auto rebuilt = source.rebuild(42);
+  EXPECT_EQ(rebuilt.size(), 0U);
+  EXPECT_EQ(rebuilt.stats().node_count, 0U);
+  EXPECT_EQ(rebuilt.stats().deleted_count, 0U);
+  rebuilt.add(7, std::vector<float>{0, 1});
+  EXPECT_EQ(rebuilt.search(std::vector<float>{0, 1}, 1),
+            (std::vector<fast_vector::SearchResult>{{7, 1}}));
 }
 
 TEST(HnswIndexTest, HeuristicSelectionBuildsBoundedDeterministicGraph) {
