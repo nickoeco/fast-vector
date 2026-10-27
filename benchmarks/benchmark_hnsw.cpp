@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -24,6 +25,7 @@
 
 #include "fast_vector/flat_index.h"
 #include "fast_vector/hnsw_index.h"
+#include "fast_vector/hnsw_index_io.h"
 
 namespace {
 
@@ -40,6 +42,8 @@ struct BenchmarkConfig {
   std::vector<std::size_t> ef_search_values{10, 50, 100, 200};
   std::uint32_t data_seed = 20250908U;
   std::uint64_t hnsw_seed = 42;
+  std::size_t delete_percent = 0;
+  bool rebuild = false;
   fast_vector::DotProductKernel kernel = fast_vector::DotProductKernel::Scalar;
   fast_vector::HnswNeighborSelection neighbor_selection =
       fast_vector::HnswNeighborSelection::Heuristic;
@@ -53,6 +57,7 @@ struct QueryMetrics {
   double qps;
   double mean_recall;
   double minimum_recall;
+  std::size_t short_queries;
 };
 
 std::uint64_t parse_unsigned(const std::string_view text, const std::string& option) {
@@ -122,6 +127,14 @@ BenchmarkConfig parse_arguments(const int argc, char* argv[]) {
       config.data_seed = static_cast<std::uint32_t>(seed);
     } else if (option == "--hnsw-seed") {
       config.hnsw_seed = parse_unsigned(value, option);
+    } else if (option == "--delete-percent") {
+      const auto percent = parse_unsigned(value, option);
+      if (percent > 99) {
+        throw std::invalid_argument("--delete-percent must be between 0 and 99");
+      }
+      config.delete_percent = static_cast<std::size_t>(percent);
+    } else if (option == "--rebuild" && (value == "true" || value == "false")) {
+      config.rebuild = value == "true";
     } else if (option == "--kernel") {
       if (value == "scalar") {
         config.kernel = fast_vector::DotProductKernel::Scalar;
@@ -205,21 +218,36 @@ double recall(const std::vector<fast_vector::SearchResult>& truth,
 template <typename SearchFunction>
 QueryMetrics measure_queries(const std::vector<std::vector<float>>& queries,
                              const std::vector<std::vector<fast_vector::SearchResult>>& truth,
+                             const std::unordered_set<fast_vector::VectorId>& deleted_ids,
                              const std::size_t warmup_count, SearchFunction&& search,
                              double& checksum) {
   for (std::size_t i = 0; i < warmup_count; ++i) {
-    checksum += search(queries[i % queries.size()]).front().score;
+    const auto results = search(queries[i % queries.size()]);
+    if (!results.empty()) {
+      checksum += results.front().score;
+    }
   }
 
   std::vector<double> latencies_us;
   std::vector<double> recalls;
   latencies_us.reserve(queries.size());
   recalls.reserve(queries.size());
+  std::size_t short_queries = 0;
   for (std::size_t i = 0; i < queries.size(); ++i) {
     const auto start = Clock::now();
     const auto results = search(queries[i]);
     const auto end = Clock::now();
-    checksum += results.front().score;
+    if (!results.empty()) {
+      checksum += results.front().score;
+    }
+    // Validate outside the timed region so integrity checks do not inflate query latency.
+    std::unordered_set<fast_vector::VectorId> returned_ids;
+    for (const auto& result : results) {
+      if (deleted_ids.contains(result.id) || !returned_ids.insert(result.id).second) {
+        throw std::runtime_error("HNSW returned a deleted or duplicate ID");
+      }
+    }
+    short_queries += results.size() < truth[i].size() ? 1U : 0U;
     latencies_us.push_back(std::chrono::duration<double, std::micro>(end - start).count());
     recalls.push_back(recall(truth[i], results));
   }
@@ -235,7 +263,8 @@ QueryMetrics measure_queries(const std::vector<std::vector<float>>& queries,
                       percentile(latencies_us, 0.99),
                       static_cast<double>(queries.size()) * 1'000'000.0 / total_us,
                       mean_recall,
-                      minimum_recall};
+                      minimum_recall,
+                      short_queries};
 }
 
 void print_usage() {
@@ -243,8 +272,25 @@ void print_usage() {
                "[--queries Q] [--k K] [--warmup W] [--m M] "
                "[--ef-construction N] [--ef-search E1,E2,...] [--seed S] "
                "[--hnsw-seed S] [--kernel scalar|auto|avx2] "
-               "[--neighbor-selection simple|heuristic]\n";
+               "[--neighbor-selection simple|heuristic] [--delete-percent 0..99] "
+               "[--rebuild true|false]\n";
 }
+
+class TemporarySnapshot {
+ public:
+  explicit TemporarySnapshot(const std::string& tag)
+      : path_(std::filesystem::temp_directory_path() /
+              ("fast-vector-rebuild-" + tag + "-" +
+               std::to_string(Clock::now().time_since_epoch().count()) + ".fvh")) {}
+  ~TemporarySnapshot() {
+    std::error_code error;
+    std::filesystem::remove(path_, error);
+  }
+  const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
 
 }  // namespace
 
@@ -292,6 +338,30 @@ int main(const int argc, char* argv[]) {
     }
     const auto hnsw_build_end = Clock::now();
     const auto rss_after_hnsw = resident_set_size_bytes();
+
+    // A separate RNG keeps deletion sets nested across ratios without changing data or queries.
+    std::vector<fast_vector::VectorId> deletion_order(config.vector_count);
+    std::iota(deletion_order.begin(), deletion_order.end(), fast_vector::VectorId{0});
+    std::mt19937 deletion_generator(config.data_seed);
+    std::shuffle(deletion_order.begin(), deletion_order.end(), deletion_generator);
+    const auto delete_count = config.vector_count / 100 * config.delete_percent +
+                              config.vector_count % 100 * config.delete_percent / 100;
+    std::unordered_set<fast_vector::VectorId> deleted_ids;
+    for (std::size_t i = 0; i < delete_count; ++i) {
+      const auto id = deletion_order[i];
+      if (!flat.erase(id)) {
+        throw std::runtime_error("Flat deletion failed");
+      }
+      deleted_ids.insert(id);
+    }
+    const auto delete_start = Clock::now();
+    for (std::size_t i = 0; i < delete_count; ++i) {
+      if (!hnsw.erase(deletion_order[i])) {
+        throw std::runtime_error("HNSW deletion failed");
+      }
+    }
+    const auto delete_end = Clock::now();
+    const auto rss_after_deletion = resident_set_size_bytes();
 
     double checksum = 0.0;
     std::vector<std::vector<fast_vector::SearchResult>> truth;
@@ -343,6 +413,14 @@ int main(const int argc, char* argv[]) {
         << "Dot-product kernel: " << fast_vector::dot_product_kernel_name(config.kernel) << '\n'
         << "Data seed: " << config.data_seed << '\n'
         << "HNSW seed: " << config.hnsw_seed << '\n'
+        << "Deletion percent: " << config.delete_percent << '\n'
+        << "Deletion seed: " << config.data_seed << '\n'
+        << "Live vectors: " << stats.live_count << '\n'
+        << "Deleted vectors: " << stats.deleted_count << '\n'
+        << "HNSW deletion time (ms): "
+        << std::chrono::duration<double, std::milli>(delete_end - delete_start).count() << '\n'
+        << "RSS after deletion (bytes): "
+        << (rss_after_deletion ? std::to_string(*rss_after_deletion) : "unavailable") << '\n'
         << "Flat build time (ms): "
         << std::chrono::duration<double, std::milli>(flat_build_end - flat_build_start).count()
         << '\n'
@@ -364,18 +442,66 @@ int main(const int argc, char* argv[]) {
         << "Flat P99 latency (us): " << percentile(flat_latencies, 0.99) << '\n'
         << "Flat QPS: " << static_cast<double>(queries.size()) * 1'000'000.0 / flat_total_us << '\n'
         << "\nHNSW query sweep:\n"
-        << "efSearch,mean_recall,min_recall,average_us,p50_us,p95_us,p99_us,qps\n";
+        << "efSearch,mean_recall,min_recall,average_us,p50_us,p95_us,p99_us,qps,short_queries\n";
 
     for (const std::size_t ef_search : config.ef_search_values) {
       const QueryMetrics metrics = measure_queries(
-          queries, truth, config.warmup_count,
+          queries, truth, deleted_ids, config.warmup_count,
           [&hnsw, &config, ef_search](const std::vector<float>& query) {
             return hnsw.search(query, config.top_k, ef_search);
           },
           checksum);
       std::cout << ef_search << ',' << metrics.mean_recall << ',' << metrics.minimum_recall << ','
                 << metrics.average_us << ',' << metrics.p50_us << ',' << metrics.p95_us << ','
-                << metrics.p99_us << ',' << metrics.qps << '\n';
+                << metrics.p99_us << ',' << metrics.qps << ',' << metrics.short_queries << '\n';
+    }
+    if (config.rebuild) {
+      const auto rss_before_rebuild = resident_set_size_bytes();
+      const auto rebuild_start = Clock::now();
+      const auto rebuilt = hnsw.rebuild(config.hnsw_seed);
+      const auto rebuild_end = Clock::now();
+      const auto rss_after_rebuild = resident_set_size_bytes();
+      const auto rebuilt_stats = rebuilt.stats();
+      if (rebuilt.live_ids() != hnsw.live_ids() || rebuilt.size() != flat.size() ||
+          rebuilt_stats.node_count != flat.size() || rebuilt_stats.deleted_count != 0) {
+        throw std::runtime_error("rebuild changed the live ID set or counts");
+      }
+      TemporarySnapshot source_file("source");
+      TemporarySnapshot rebuilt_file("compact");
+      fast_vector::save_hnsw_index(hnsw, source_file.path());
+      fast_vector::save_hnsw_index(rebuilt, rebuilt_file.path());
+      std::cout
+          << "\nRebuild seed: " << config.hnsw_seed << '\n'
+          << "Rebuild time (ms): "
+          << std::chrono::duration<double, std::milli>(rebuild_end - rebuild_start).count() << '\n'
+          << "Live-ID verification: match\n"
+          << "Rebuilt physical nodes: " << rebuilt_stats.node_count << '\n'
+          << "Rebuilt tombstones: " << rebuilt_stats.deleted_count << '\n'
+          << "Source snapshot bytes: " << std::filesystem::file_size(source_file.path()) << '\n'
+          << "Rebuilt snapshot bytes: " << std::filesystem::file_size(rebuilt_file.path()) << '\n'
+          << "Source vector/ID payload bytes: " << vector_payload_bytes << '\n'
+          << "Rebuilt vector/ID payload bytes: "
+          << static_cast<std::uint64_t>(rebuilt_stats.node_count) *
+                 (static_cast<std::uint64_t>(config.dimension) * sizeof(float) +
+                  sizeof(fast_vector::VectorId))
+          << '\n'
+          << "RSS before rebuild (bytes): "
+          << (rss_before_rebuild ? std::to_string(*rss_before_rebuild) : "unavailable") << '\n'
+          << "RSS with both HNSW indexes (bytes): "
+          << (rss_after_rebuild ? std::to_string(*rss_after_rebuild) : "unavailable") << '\n'
+          << "Rebuilt HNSW query sweep:\n"
+          << "efSearch,mean_recall,min_recall,average_us,p50_us,p95_us,p99_us,qps,short_queries\n";
+      for (const auto ef_search : config.ef_search_values) {
+        const auto metrics = measure_queries(
+            queries, truth, deleted_ids, config.warmup_count,
+            [&rebuilt, &config, ef_search](const auto& query) {
+              return rebuilt.search(query, config.top_k, ef_search);
+            },
+            checksum);
+        std::cout << ef_search << ',' << metrics.mean_recall << ',' << metrics.minimum_recall << ','
+                  << metrics.average_us << ',' << metrics.p50_us << ',' << metrics.p95_us << ','
+                  << metrics.p99_us << ',' << metrics.qps << ',' << metrics.short_queries << '\n';
+      }
     }
     std::cout << "Checksum: " << checksum << '\n';
   } catch (const std::exception& error) {

@@ -7,6 +7,9 @@ a from-scratch approximate HNSW index using cosine similarity.
 ## Implemented features
 
 - Fixed-dimension `VectorIndex` interface and `FlatIndex` implementation
+- FlatIndex deletion by ID with dense swap-and-pop storage
+- HNSW tombstone deletion with live-only results and versioned persistence
+- HNSW insertion rollback under allocation failure and offline tombstone-free rebuild
 - User-provided 64-bit vector IDs with duplicate rejection
 - L2 normalization on insertion and query
 - Contiguous row-major `std::vector<float>` storage
@@ -22,7 +25,7 @@ a from-scratch approximate HNSW index using cosine similarity.
 - Thread-safe `VectorStore` application layer with serialized insertion and concurrent search
 - Optional synchronous gRPC server with protobuf code generation and standard health checks
 
-Deletion, authentication, TLS, and metadata storage are not implemented yet.
+Service deletion, authentication, TLS, and metadata storage are not implemented yet.
 Persistence currently means complete FlatIndex and HnswIndex snapshots; incremental
 persistence is not implemented. HNSW supports both simple nearest-M and diversity-aware
 neighbor selection, with reproducible Recall@K validation against NumPy ground truth.
@@ -90,8 +93,26 @@ values are rejected with `std::invalid_argument`.
 All normalized vectors occupy one contiguous row-major array. For dimension `d`, the
 vector at row `i` begins at `vectors.data() + i * d`. Compared with a vector of vectors,
 this removes per-row allocations and improves locality during a full scan. The tradeoffs
-are fixed dimensions, whole-buffer reallocations during growth, and more complicated
-deletion; deletion is outside the current scope.
+are fixed dimensions, whole-buffer reallocations during growth, and moving a row during deletion.
+
+`FlatIndex::erase(id)` returns `true` when an ID is removed and `false` when it is absent.
+A hash map locates the row. The last row moves into the hole, its ID mapping is updated,
+and the vector and ID arrays shrink. This keeps live vectors contiguous with average `O(d)`
+deletion work (worst-case `O(N + d)` with hash collisions), instead of shifting every later row.
+Internal row order is not stable; public search ordering remains score descending, then ID
+ascending. Deleted IDs may be inserted again with new values. The map uses more memory than
+the previous duplicate-ID set. Array capacity can remain allocated after deletion; this is
+logical removal, not secure memory wiping.
+
+```cpp
+const bool removed = index.erase(1001);
+```
+
+Both concrete indexes expose `erase(id)`; the common `VectorIndex`, `VectorStore`, and
+gRPC API retain their existing operations. Saving a FlatIndex after deletion writes only live rows in the
+existing version 1 Flat format; loading reconstructs the ID-to-row map. Previously saved files
+are unchanged until explicitly saved or replaced. See [deletion design](docs/deletion.md) for
+invariants, tests, HNSW tombstones, and the proposed offline rebuild work.
 
 For a vector `x`, L2 normalization is:
 
@@ -131,19 +152,54 @@ permit `M`. `M`, `ef_construction`, and `ef_search` are explicit configuration v
 The per-call search overload raises an `ef_search` below `k` to `k`, because at least `k`
 retained candidates are required to return `k` results.
 
+`HnswIndex::erase(id)` marks a node deleted in average `O(1)` time; missing or already-deleted
+IDs return `false`. It retains vectors, edges, entry point, and ID mappings. Deleted IDs remain
+reserved and `add()` rejects their reuse. `size()` reports live vectors; `stats().node_count`
+reports physical nodes, with separate `live_count` and `deleted_count`. Searches can traverse
+tombstones for navigation but never admit them to the result queue. They target at most
+`min(k, size())` live results; approximate recall is still data- and budget-dependent.
+Insertion uses physical node positions and can continue with new IDs even after all old IDs
+are deleted. Graph construction may link through tombstones. `erase()` retains tombstone
+storage; offline `rebuild(seed)` creates a new dense graph containing only live IDs.
+
+HNSW `add()` provides a strong logical exception guarantee: if it throws, vector contents,
+IDs, topology, tombstones, entry point, and RNG state are unchanged. Internal capacity and RSS
+may change. A rollback journal copies only touched adjacency lists, including reverse edges;
+it never allocates during rollback. A separate test executable injects persistent allocation
+failure at each ordinary C++ allocation point for the covered scenarios, checks snapshot/query
+equality, and retries insertion. The library has no fault-injection hooks. Batch insertion
+remains nontransactional across multiple successful `add()` calls.
+
+To compact a snapshot on Linux:
+
+```bash
+./build-release/fast_vector_rebuild_hnsw \
+  --input graph-with-tombstones.fvh --output compact.fvh --seed 42
+```
+
+The tool keeps normalized vector bits and live IDs, inserts in ascending ID order with a fresh
+recorded seed, verifies the ID set, and uses validated durable publication. It rejects an output
+alias of the source and defaults to no overwrite; `--overwrite true` replaces a different
+existing output. Without `--seed`, it starts from the source configuration's seed, not its
+advanced RNG state. The CLI loads using the scalar kernel; the C++ method retains the source's
+runtime kernel. New graph topology and approximate results may differ. Output includes file
+sizes, stage timings, RSS, and peak process RSS. Source and rebuilt indexes coexist during
+rebuild, and publication validation temporarily loads another copy. Compare Recall against the
+same survivor-only Flat ground truth, using `--rebuild true` in the HNSW benchmark.
+
 ## Thread safety
 
 `FlatIndex` contains no internal synchronization. Concurrent calls to `search()` are
-safe only while no thread is calling `add()`. Calling `add()` concurrently with any
-other operation, or calling `add()` from multiple threads, is unsupported and requires
+safe only while no thread is calling `add()` or `erase()`. Calling either mutating operation
+concurrently with any other operation is unsupported and requires
 external synchronization. `BatchSearcher` owns persistent workers and performs concurrent
 read-only calls while preserving input query order. The referenced index must outlive the
 searcher and remain immutable. Destroying a `BatchSearcher` concurrently with `search()` is
 unsupported.
 
 `HnswIndex` also contains no internal synchronization. Concurrent read-only searches are
-safe only after construction has finished. Insertion concurrent with search or another
-insertion is unsupported.
+safe while there is no mutation. Insertion or deletion concurrent with any other operation
+requires external synchronization.
 
 ## Application layer
 
@@ -212,10 +268,11 @@ Message size is bounded separately by
 `--max-message-bytes`. Batch insertion is not transactional when an ID already exists in the
 index, as described above.
 
-The server can load a FlatIndex version 1 or HNSW version 1/2 snapshot before accepting
+The server can load a FlatIndex version 1 or HNSW version 1/2/3 snapshot before accepting
 requests. Select the matching `--index flat|hnsw` type. The loaded file defines the dimension;
 `--dimension` is used only when constructing an empty index. For HNSW, the snapshot also defines
-`M`, `efConstruction`, `efSearch`, random seed, neighbor selection, graph, and RNG state (v2).
+`M`, `efConstruction`, `efSearch`, random seed, neighbor selection, graph, RNG state (v2/v3),
+and tombstones (v3).
 The corresponding command-line construction options are ignored when loading a snapshot.
 Read-only mode rejects both insertion RPCs while retaining search and statistics:
 
@@ -503,6 +560,15 @@ payload bytes, and approximate process RSS deltas. Payload values intentionally 
 container, hash-table, allocator, and alignment overhead; RSS includes unrelated process
 memory and allocator behavior. Neither value is an exact retained-memory measurement.
 
+Use `--delete-percent 0..99` to mark a seeded random subset before querying. Both indexes
+remove the same IDs, so Recall@K uses only live ground truth. Additional output reports live
+and deleted counts, HNSW marking time, RSS after deletion, and short-result queries. A deleted
+or duplicate result ID fails the run. See [deletion experiments](docs/deletion.md#deletion-ratio-experiments)
+for a repeatable ratio sweep.
+Add `--rebuild true` to measure a compacted graph against that same ground truth and report
+live-ID equality, before/after snapshot sizes, vector/ID payload, rebuild time, and process RSS.
+Coexisting indexes and allocator retention mean process RSS is not an isolated index-size metric.
+
 Queries run sequentially in-process, so these figures measure a single-thread algorithmic
 tradeoff rather than concurrent service latency. Results are not pre-recorded because they
 depend on CPU, compiler, kernel, workload, parameters, and build flags.
@@ -538,11 +604,11 @@ The loader rejects unknown versions or flags, invalid dimensions and sizes, trun
 trailing data, checksum mismatches, duplicate IDs, non-finite components, and vectors that
 are not L2-normalized. The checksum detects accidental corruption; FNV-1a is not a
 cryptographic authenticity mechanism. The format does not serialize C++ container objects
-or pointers, and loading rebuilds the duplicate-ID set. The low-level `save_flat_index()` API
+or pointers, and loading rebuilds the ID-to-row map. The low-level `save_flat_index()` API
 writes exactly the requested path and does not provide crash-atomic replacement. Use the offline
 builder when publishing or replacing a deployable snapshot.
 
-`HnswIndex` has a separate version 2 binary format (the loader also accepts version 1):
+`HnswIndex` writes a separate version 3 binary format (the loader also accepts versions 1/2):
 
 ```cpp
 #include "fast_vector/hnsw_index_io.h"
@@ -557,14 +623,18 @@ Its 112-byte little-endian header stores an HNSW-specific magic, version, header
 endianness marker, cosine flag, dimension, node count, `M`, `efConstruction`, `efSearch`, random
 seed, neighbor selection strategy, maximum level, entry point, payload size, and checksum.
 The payload contains ordered external IDs, contiguous normalized float32 vectors, then each
-node's level and per-layer degree and NodeIndex list. Version 2 appends the current
-`std::mt19937_64` state as a length-prefixed, classic-locale stream representation, so insertion
+node's level and per-layer degree and NodeIndex list. Version 3 then stores the live count as
+uint64 followed by one uint8 tombstone flag per physical node (0 = live, 1 = deleted), before
+the RNG block. Counts and flags must agree. Versions 1/2 load all nodes as live.
+Versions 2/3 preserve the current `std::mt19937_64` state as a length-prefixed, classic-locale
+stream representation, so insertion
 can continue with the same level sequence on a compatible C++ standard-library implementation.
 Version 1 loads with the saved seed but cannot reproduce the pre-save RNG position. FNV-1a
 covers the header fields (except the checksum slot) and entire payload. The loader rejects
 invalid configuration, size or arithmetic overflow, duplicate IDs, non-finite or unnormalized
 vectors, excessive degrees, out-of-range or repeated neighbors, self-loops, invalid layer
-references, an invalid entry point, and malformed RNG state. FNV-1a detects accidental
+references, an invalid entry point, malformed RNG state, and invalid tombstone flags/counts.
+A deleted entry point remains valid for navigation. FNV-1a detects accidental
 corruption, not intentional tampering.
 The runtime dot-product kernel is chosen on load and is not serialized. Direct
 `save_hnsw_index` writes the requested path and can truncate an existing file. On Linux,

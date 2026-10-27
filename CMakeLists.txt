@@ -97,6 +97,11 @@ target_link_libraries(fast_vector_build_index PRIVATE fast_vector::fast_vector)
 fast_vector_set_warnings(fast_vector_build_index)
 fast_vector_enable_sanitizers(fast_vector_build_index)
 
+add_executable(fast_vector_rebuild_hnsw tools/rebuild_hnsw_index.cpp)
+target_link_libraries(fast_vector_rebuild_hnsw PRIVATE fast_vector::fast_vector)
+fast_vector_set_warnings(fast_vector_rebuild_hnsw)
+fast_vector_enable_sanitizers(fast_vector_rebuild_hnsw)
+
 if(FAST_VECTOR_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(
@@ -130,6 +135,18 @@ if(FAST_VECTOR_BUILD_TESTS)
     fast_vector_set_warnings(fast_vector_hnsw_failure_tests)
     fast_vector_enable_sanitizers(fast_vector_hnsw_failure_tests)
     gtest_discover_tests(fast_vector_hnsw_failure_tests)
+    add_executable(fast_vector_hnsw_snapshot_fixture tests/make_hnsw_snapshot.cpp)
+    target_link_libraries(fast_vector_hnsw_snapshot_fixture PRIVATE fast_vector::fast_vector)
+    fast_vector_set_warnings(fast_vector_hnsw_snapshot_fixture)
+    fast_vector_enable_sanitizers(fast_vector_hnsw_snapshot_fixture)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME HnswRebuildCliTest
+            COMMAND ${CMAKE_COMMAND}
+                -DREBUILDER=$<TARGET_FILE:fast_vector_rebuild_hnsw>
+                -DFIXTURE=$<TARGET_FILE:fast_vector_hnsw_snapshot_fixture>
+                -DWORKSPACE=${CMAKE_CURRENT_BINARY_DIR}/hnsw-rebuild-test
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rebuild_hnsw.cmake)
+    endif()
     add_test(
         NAME BuildIndexCliTest
         COMMAND ${CMAKE_COMMAND}
@@ -183,11 +200,6 @@ if(FAST_VECTOR_BUILD_GRPC)
     fast_vector_enable_sanitizers(fast_vector_server)
 
     if(FAST_VECTOR_BUILD_TESTS)
-        add_executable(fast_vector_hnsw_snapshot_fixture tests/make_hnsw_snapshot.cpp)
-        target_link_libraries(fast_vector_hnsw_snapshot_fixture PRIVATE fast_vector::fast_vector)
-        fast_vector_set_warnings(fast_vector_hnsw_snapshot_fixture)
-        fast_vector_enable_sanitizers(fast_vector_hnsw_snapshot_fixture)
-
         add_executable(fast_vector_grpc_tests tests/test_grpc_service.cpp)
         target_link_libraries(fast_vector_grpc_tests
             PRIVATE fast_vector_grpc_service GTest::gtest_main

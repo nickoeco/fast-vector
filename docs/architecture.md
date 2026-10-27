@@ -34,9 +34,24 @@ non-owning `std::span` views; an index owns every vector after insertion.
 uses randomized layers, greedy upper-layer descent, and a bounded layer-zero candidate search.
 The exact index supplies ground truth for approximate-index recall measurements.
 
+`FlatIndex::erase()` uses an ID-to-row hash map and swap-and-pop to keep storage dense. The
+moved row keeps its external ID, and score/ID result ordering does not depend on row order.
+Flat snapshots retain their version 1 layout and store only live rows. `HnswIndex::erase()`
+keeps physical nodes and edges as tombstones. Navigation can use them while the result queue
+admits only live nodes. Both concrete indexes support deletion, but the common interface and
+service do not expose it. HNSW size is the live count; graph statistics distinguish physical,
+live, and deleted nodes. Offline rebuild preserves live IDs and normalized vector bits while
+creating new topology in ID order. See [deletion.md](deletion.md) for the workflow.
+
+HNSW insertion keeps a rollback journal of original adjacency lists before each mutation,
+including reverse-link edits. Exceptions restore these lists, remove any appended node/ID/vector,
+erase the newly inserted map entry, and restore RNG/entry state without allocating. This is
+a strong logical guarantee; container capacity may change. Rebuild returns a new index and
+leaves its source unchanged even if construction fails.
+
 `VectorStore` owns one `VectorIndex`. It uses a shared mutex so multiple searches may run
 concurrently while insertion remains exclusive. Index implementations themselves do not
-promise concurrent insertion and search.
+promise concurrent mutation and search, including deletion.
 
 ## Service boundary
 
@@ -72,12 +87,13 @@ to chunks. The output is retrieval evidence, not an LLM-generated answer.
 
 ## Persistence
 
-FlatIndex version 1 and HNSW version 2 persistence use distinct magic values, fixed-width
-little-endian fields, and an FNV-1a checksum. The HNSW loader also accepts version 1. The HNSW
+FlatIndex version 1 and HNSW version 3 persistence use distinct magic values, fixed-width
+little-endian fields, and an FNV-1a checksum. The HNSW loader also accepts versions 1/2. The HNSW
 format preserves graph parameters, seed, neighbor policy, external IDs, normalized vector rows,
 levels, adjacency lists, maximum level, and entry point. Version 2 additionally preserves the
 current RNG state, allowing deterministic insertion continuation with a compatible standard
-library; version 1 resumes from the initial seed instead. The loader validates bounded sizes
+library; version 1 resumes from the initial seed instead. Version 3 adds live count and
+tombstone flags under the checksum; old formats load as all-live. The loader validates bounded sizes
 before allocation and checks every graph reference and layer relationship. On Linux,
 `publish_hnsw_index` validates a same-directory temporary snapshot before durable publication;
 explicit overwrite atomically replaces the destination.
@@ -110,7 +126,7 @@ replication or consistency.
 
 ## Known limitations
 
-- No deletion or incremental persistence.
+- No online HNSW compaction, service deletion API, or incremental persistence.
 - No HNSW hot reload or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.

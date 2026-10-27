@@ -169,7 +169,8 @@ int main(const int argc, char* argv[]) {
     const auto after = loaded.stats();
     if (before.node_count != after.node_count || before.max_level != after.max_level ||
         before.directed_edge_count != after.directed_edge_count ||
-        before.maximum_node_degree != after.maximum_node_degree) {
+        before.maximum_node_degree != after.maximum_node_degree ||
+        before.live_count != after.live_count || before.deleted_count != after.deleted_count) {
       throw std::runtime_error("loaded graph statistics differ");
     }
 
