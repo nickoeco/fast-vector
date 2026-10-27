@@ -93,8 +93,8 @@ TEST(VectorStoreTest, CountsFailedQueriesAndZeroKAsSuccessful) {
   fast_vector::VectorStore store(make_index());
   store.add(1, std::vector<float>{1.0F, 0.0F});
 
-  EXPECT_THROW(store.search(std::vector<float>{1.0F}, 1), std::invalid_argument);
-  EXPECT_THROW(store.search(std::vector<float>{0.0F, 0.0F}, 1), std::invalid_argument);
+  EXPECT_THROW((void)store.search(std::vector<float>{1.0F}, 1), std::invalid_argument);
+  EXPECT_THROW((void)store.search(std::vector<float>{0.0F, 0.0F}, 1), std::invalid_argument);
   EXPECT_TRUE(store.search(std::vector<float>{}, 0).empty());
 
   const fast_vector::StoreStats stats = store.stats();
