@@ -49,8 +49,12 @@ erase the newly inserted map entry, and restore RNG/entry state without allocati
 a strong logical guarantee; container capacity may change. Rebuild returns a new index and
 leaves its source unchanged even if construction fails.
 
-`VectorStore` owns one `VectorIndex`. It uses a shared mutex so multiple searches may run
-concurrently while insertion remains exclusive. Index implementations themselves do not
+`VectorStore` uses a shared mutex for writable indexes: searches share it and insertion is
+exclusive. Read-only stores atomically publish an immutable shared index pointer instead.
+Each query and statistics call acquires one owning snapshot without holding the store mutex;
+old queries retain the previous snapshot across replacement. C++20 atomic shared-pointer
+specialization is used when available, with atomic shared-pointer functions on libstdc++ 11.
+Atomic pointer operations are not necessarily lock-free. Index implementations themselves do not
 promise concurrent mutation and search, including deletion.
 
 ## Service boundary
@@ -100,9 +104,12 @@ explicit overwrite atomically replaces the destination.
 
 The gRPC server can load a FlatIndex or HNSW snapshot before opening its listening port and can
 reject all later writes in read-only mode. The snapshot dimension and HNSW configuration are
-authoritative. On Linux, an explicit Flat-only SIGHUP mode loads and validates a replacement
-outside the store lock, then swaps index ownership under an exclusive lock. Failed reloads
-preserve the current in-memory index. Automatic saving and HNSW hot reload are not implemented.
+authoritative. On Linux, an explicit read-only SIGHUP mode loads and validates a Flat or HNSW
+replacement and then atomically publishes shared immutable ownership. Publication does not
+wait for active queries, which retain their previous snapshot until completion. Failed reloads
+preserve the current in-memory index. The configured index type stays fixed; new snapshot
+dimensions and HNSW parameters are authoritative. Old and new snapshots may coexist in memory;
+final-reference release performs destruction. Automatic saving and writable hot reload are not implemented.
 The default container and Kubernetes commands still start with an empty index unless an operator
 mounts a snapshot and supplies the loading arguments.
 
@@ -137,7 +144,7 @@ replication or consistency.
 ## Known limitations
 
 - No online HNSW compaction, service deletion API, or incremental persistence.
-- No HNSW hot reload or concurrent HNSW construction.
+- No writable hot reload or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.
 - No multi-replica consistency for writable indexes; immutable read-only snapshots can be

@@ -203,10 +203,12 @@ requires external synchronization.
 
 ## Application layer
 
-`VectorStore` owns one `VectorIndex` and supplies the synchronization boundary needed by a
-future service adapter. Searches take a shared lock, so multiple read-only requests can run
-concurrently. Single and batch insertion take an exclusive lock and therefore block all
-searches for the duration of the mutation. Counters track successful and failed searches
+`VectorStore` supplies two ownership paths. Writable stores own a `unique_ptr<VectorIndex>`:
+searches take a shared lock, while single and batch insertion take an exclusive lock and block
+searches for the duration of mutation. Read-only stores publish an immutable
+`shared_ptr<const VectorIndex>` atomically. Each search and statistics call acquires one
+snapshot and retains it for that operation, without holding the store's shared mutex.
+Counters track successful and failed searches
 plus vectors inserted through the store; they do not infer vectors that may have existed in
 an index before ownership was transferred.
 
@@ -301,13 +303,28 @@ read-only configuration. Publish a verified replacement to the same `--load-inde
 kill -HUP <server-pid>
 ```
 
-The server loads and validates the file before taking the store's exclusive lock, so disk I/O
-does not block searches. The lock only protects the final index-pointer swap: searches already
-holding the shared lock finish on the old index, and later searches use the new index. Query
-counters survive the reload; snapshot vectors still do not count as process-local insertions.
+Flat and HNSW use the same reload path. The server loads and validates a complete replacement
+before publishing it with a release operation; queries acquire their snapshot atomically.
+Publication does not wait for old searches: each finishes on its retained snapshot, and later
+acquisitions use the replacement. Query counters survive the reload; snapshot vectors still
+do not count as process-local insertions. `stats()` reads size and dimension from one snapshot,
+but separate RPCs can observe different generations. A replacement may change the dimension
+and HNSW configuration, so clients must use the new dimension for subsequent queries.
 If loading fails, the server logs the error, keeps serving the previous in-memory index, and
 remains healthy. Multiple SIGHUP notifications may coalesce into one reload. Hot reload is not
-available for writable stores, empty indexes, HNSW, or non-Linux platforms.
+available for writable stores, stores without `--load-index`, or non-Linux platforms. Empty
+snapshots are valid replacements. The configured `--index` selects the loader and cannot be
+changed by a reload; a snapshot of the other format is rejected. For HNSW, publish a snapshot
+with `publish_hnsw_index` or `fast_vector_rebuild_hnsw --overwrite true` before sending SIGHUP.
+
+The implementation uses C++20 `atomic<shared_ptr<...>>` when the standard library supports it,
+and the equivalent shared-pointer atomic load/store APIs on libstdc++ 11 (Ubuntu 22.04).
+Neither API promises lock-free execution: only snapshot acquisition/publication is atomic,
+and no store mutex spans the search. Shared ownership adds reference-count overhead. Old
+snapshots remain allocated until their last reader releases them; loading a replacement can
+temporarily retain both indexes, and the thread releasing the final reference destroys the
+old index. This is not a bounded-memory or guaranteed-latency reclamation scheme. Callers must
+transfer exclusive ownership and must not mutate snapshots through retained raw aliases.
 
 The server writes structured JSON Lines to stderr for startup configuration, snapshot loading,
 RPC outcomes, shutdown reasons, and per-status error totals. It logs only allowlisted metadata;
@@ -315,7 +332,7 @@ vectors, document text, request metadata, snapshot paths, and raw exception mess
 See [structured logging](docs/logging.md) for fields, timing boundaries, collection, and limitations.
 
 The server enables gRPC's standard health-check service. Transport security, authentication,
-persistence during service operation, HNSW hot reload, reflection, and production observability
+persistence during service operation, writable hot reload, reflection, and production observability
 remain outside this phase.
 
 The Python integration suite also exercises the complete snapshot-serving path: it builds a
@@ -327,7 +344,9 @@ snapshot cannot replace the valid in-memory index. Set
 `FAST_VECTOR_SERVER` and `FAST_VECTOR_BUILDER` when the executables are outside `build-grpc`.
 The same suite loads a generated HNSW snapshot through the server, checks health, search,
 statistics, read-only rejection and writable continuation, and rejects a corrupt snapshot at
-startup. Set `FAST_VECTOR_HNSW_FIXTURE` as well when its test executable is outside `build-grpc`.
+startup. Both index types are tested with concurrent queries across reload, corrupt or wrong-format
+replacement rejection, preserved health, and read-only write rejection. Set `FAST_VECTOR_HNSW_FIXTURE`
+as well when its test executable is outside `build-grpc`.
 
 ### Python client and service load test
 
@@ -805,7 +824,7 @@ No release tag is created automatically.
 
 ## Roadmap
 
-Planned work adds transport security, HNSW hot reload, production observability, and writable
+Planned work adds transport security, writable hot reload, production observability, and writable
 multi-replica consistency. The exact `FlatIndex` remains the correctness and recall baseline
 for approximate indexes.
 

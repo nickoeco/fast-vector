@@ -144,9 +144,10 @@ be described as the isolated memory size of the compacted index. The snapshot an
 measurements quantify storage reduction separately. Unit tests preserve exact vector bytes,
 verify deterministic snapshots and post-load queries, and check source/output file protection.
 
-Read-only serving can swap compacted snapshots after its HNSW reload path is extended; writable
-serving needs a write-exclusion or replay design to avoid losing writes. This offline tool does
-not install a rebuilt index in a running server.
+Read-only serving can load compacted HNSW snapshots through its SIGHUP reload path. Publish to
+the configured snapshot path, then signal the server to acquire and atomically install the
+replacement. Writable serving still needs a write-exclusion or replay design to avoid losing
+writes. This offline tool itself does not signal or install an index in a running server.
 
 ## Deletion-ratio experiments
 

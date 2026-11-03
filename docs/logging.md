@@ -40,7 +40,8 @@ observations, not a transactional view tied to the individual request.
 | `index_load_started` | `operation`: `startup` or `reload`; status `IN_PROGRESS` |
 | `index_load_completed` | Operation, dimension, vector count, total load/validation time; status `OK` |
 | `index_load_failed` | Operation, elapsed time, sanitized reason, `kept_previous_index`; status `FAILED_PRECONDITION` |
-| `index_replaced` | Live replacement count and dimension after a successful Flat reload |
+| `index_replaced` | Live replacement count and dimension after successful Flat or HNSW publication |
+| `index_replace_failed` | Publication failure after successful loading; previous snapshot retained |
 | `server_started` | Selected listening port after gRPC starts |
 | `rpc_completed` | Method, request ID, gRPC status, numeric `status_code`, handler latency |
 | `shutdown_requested` | Reason: `SIGINT`, `SIGTERM`, or `internal_stop` |
@@ -50,8 +51,9 @@ observations, not a transactional view tied to the individual request.
 | `startup_failed`, `server_failed` | Sanitized phase/reason and static command usage |
 
 When loading a snapshot, load events precede `startup_config`: the snapshot supplies the
-effective dimension and HNSW parameters. File paths are omitted. A failed Flat reload leaves
-the current index in place. HNSW hot reload is still unsupported.
+effective dimension and HNSW parameters. File paths are omitted. Flat and HNSW share the
+read-only reload events. `index_load_completed` means loading and validation succeeded;
+`index_replaced` confirms atomic publication. A failed load leaves the current index in place.
 
 RPC latency includes application validation, index access, and response construction, ending
 before logging. It excludes network transport, protobuf transport serialization, and the log
