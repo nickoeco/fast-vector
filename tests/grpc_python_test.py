@@ -442,7 +442,7 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
                             record["status"] == "FAILED_PRECONDITION" for record in records))
         self.assertNotIn(str(corrupt_path), result.stderr)
 
-    def test_hnsw_sighup_reload_remains_unsupported(self) -> None:
+    def test_writable_hnsw_sighup_reload_is_rejected(self) -> None:
         result = subprocess.run(
             [
                 str(self._server_path),
@@ -451,7 +451,7 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
                 "--load-index",
                 str(self._snapshot_path),
                 "--read-only",
-                "true",
+                "false",
                 "--reload-on-sighup",
                 "true",
             ],
@@ -490,6 +490,133 @@ class HnswSnapshotServerIntegrationTest(unittest.TestCase):
                 self.assertEqual(stats.inserted_vectors, 1)
         finally:
             stop_server(server)
+
+
+class SnapshotReloadIntegrationTest(unittest.TestCase):
+    def test_reload_requires_read_only_mode_and_snapshot_path(self) -> None:
+        server = Path(os.environ.get("FAST_VECTOR_SERVER", REPOSITORY_ROOT / "build-grpc/fast_vector_server"))
+        if not server.is_file():
+            self.skipTest("gRPC server executable not found")
+        for index_type in ("flat", "hnsw"):
+            for arguments in (
+                ["--read-only", "true"],
+                ["--load-index", "unused-snapshot-path", "--read-only", "false"],
+            ):
+                with self.subTest(index_type=index_type, arguments=arguments):
+                    result = subprocess.run(
+                        [str(server), "--index", index_type, "--reload-on-sighup", "true", *arguments],
+                        capture_output=True, text=True, timeout=5, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    records = [json.loads(line) for line in result.stderr.splitlines()]
+                    self.assertEqual(records[-1]["event"], "startup_failed")
+                    self.assertEqual(records[-1]["status"], "INVALID_ARGUMENT")
+
+    def test_flat_and_hnsw_reload_with_concurrent_queries_and_failed_replacements(self) -> None:
+        server = Path(os.environ.get("FAST_VECTOR_SERVER", REPOSITORY_ROOT / "build-grpc/fast_vector_server"))
+        builder = Path(os.environ.get("FAST_VECTOR_BUILDER", REPOSITORY_ROOT / "build-grpc/fast_vector_build_index"))
+        fixture = Path(os.environ.get("FAST_VECTOR_HNSW_FIXTURE", REPOSITORY_ROOT / "build-grpc/fast_vector_hnsw_snapshot_fixture"))
+        if not all(path.is_file() for path in (server, builder, fixture)):
+            self.skipTest("snapshot reload executables not found")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = root / "generated"
+            generate(REPOSITORY_ROOT / "proto", generated)
+            flat = root / "original.fv"
+            hnsw = root / "original.fvh"
+            flat_replacement = root / "replacement.fv"
+            hnsw_replacement = root / "replacement.fvh"
+            data = root / "replacement.jsonl"
+            data.write_text(json.dumps({"id": 999, "values": [0.0, 0.0, 1.0]}) + "\n", encoding="utf-8")
+            commands = (
+                [str(builder), "--input", str(REPOSITORY_ROOT / "tests/data/vectors.jsonl"),
+                 "--output", str(flat), "--dimension", "3"],
+                [str(builder), "--input", str(data), "--output", str(flat_replacement), "--dimension", "3"],
+                [str(fixture), str(hnsw)],
+                [str(fixture), str(hnsw_replacement), "--replacement"],
+            )
+            for command in commands:
+                subprocess.run(command, capture_output=True, text=True, check=True, timeout=10)
+
+            for index_type, original, replacement, other_format in (
+                ("flat", flat, flat_replacement, hnsw),
+                ("hnsw", hnsw, hnsw_replacement, flat),
+            ):
+                with self.subTest(index_type=index_type):
+                    active = root / f"active-{index_type}"
+                    active.write_bytes(original.read_bytes())
+                    log_path = root / f"{index_type}.jsonl"
+                    address = f"127.0.0.1:{reserve_local_port()}"
+                    expected = (999,) if index_type == "flat" else (999, 1000)
+                    with log_path.open("w", encoding="utf-8") as output:
+                        process = subprocess.Popen(
+                            [str(server), "--address", address, "--index", index_type,
+                             "--load-index", str(active), "--read-only", "true",
+                             "--reload-on-sighup", "true"],
+                            stdout=subprocess.DEVNULL, stderr=output,
+                        )
+                        try:
+                            with VectorSearchClient(address, generated, timeout_seconds=5.0) as client:
+                                def query_many():
+                                    for _ in range(30):
+                                        result = client.search([0.0, 0.0, 1.0], 10)
+                                        ids = tuple(neighbor.id for neighbor in result.neighbors)
+                                        if ids not in ((101, 102, 103), expected):
+                                            raise AssertionError(f"mixed snapshot result: {ids}")
+
+                                self.assertEqual(client.stats().vector_count, 3)
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                                    readers = [pool.submit(query_many) for _ in range(4)]
+                                    published = root / f"publish-{index_type}"
+                                    published.write_bytes(replacement.read_bytes())
+                                    published.replace(active)
+                                    process.send_signal(signal.SIGHUP)
+                                    deadline = time.monotonic() + 5.0
+                                    while time.monotonic() < deadline:
+                                        if client.search([0.0, 0.0, 1.0], 1).neighbors[0].id == 999:
+                                            break
+                                        time.sleep(0.02)
+                                    else:
+                                        self.fail("replacement snapshot was not published")
+                                    for reader in readers:
+                                        reader.result()
+                                stats = client.stats()
+                                self.assertEqual(stats.vector_count, len(expected))
+                                self.assertEqual(stats.dimension, 3)
+                                self.assertEqual(stats.index_type, index_type)
+                                self.assertEqual(stats.inserted_vectors, 0)
+                                for payload in (b"corrupt snapshot", other_format.read_bytes()):
+                                    failures = sum(record["event"] == "index_load_failed"
+                                                   for record in read_log_records(log_path))
+                                    published.write_bytes(payload)
+                                    published.replace(active)
+                                    process.send_signal(signal.SIGHUP)
+                                    deadline = time.monotonic() + 5.0
+                                    while time.monotonic() < deadline:
+                                        records = read_log_records(log_path)
+                                        if sum(record["event"] == "index_load_failed" for record in records) > failures:
+                                            break
+                                        time.sleep(0.02)
+                                    else:
+                                        self.fail("failed replacement was not reported")
+                                    result = client.search([0.0, 0.0, 1.0], 10)
+                                    self.assertEqual(tuple(neighbor.id for neighbor in result.neighbors), expected)
+                                    with grpc.insecure_channel(address) as channel:
+                                        health = health_pb2_grpc.HealthStub(channel)
+                                        response = health.Check(health_pb2.HealthCheckRequest(service=""), timeout=5.0)
+                                        self.assertEqual(response.status, health_pb2.HealthCheckResponse.SERVING)
+                                with self.assertRaises(grpc.RpcError) as rejected:
+                                    client.add(5000, [1.0, 0.0, 0.0])
+                                self.assertEqual(rejected.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+                        finally:
+                            stop_server(process)
+                    self.assertEqual(process.returncode, 0)
+                    records = read_log_records(log_path)
+                    self.assertTrue(any(record["event"] == "index_replaced" and
+                                        record["index_type"] == index_type for record in records))
+                    failed = [record for record in records if record["event"] == "index_load_failed"]
+                    self.assertEqual(len(failed), 2)
+                    self.assertTrue(all(record["kept_previous_index"] for record in failed))
 
 
 class StructuredLoggingIntegrationTest(unittest.TestCase):

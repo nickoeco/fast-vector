@@ -161,10 +161,9 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
   if (config.address.empty()) {
     throw std::invalid_argument("--address must not be empty");
   }
-  if (config.reload_on_sighup &&
-      (config.index_type != "flat" || config.load_index_path.empty() || !config.read_only)) {
+  if (config.reload_on_sighup && (config.load_index_path.empty() || !config.read_only)) {
     throw std::invalid_argument(
-        "--reload-on-sighup true requires a read-only FlatIndex loaded from a snapshot");
+        "--reload-on-sighup true requires a read-only index loaded from a snapshot");
   }
 #if !defined(SIGHUP)
   if (config.reload_on_sighup) {
@@ -317,8 +316,10 @@ int main(const int argc, char* argv[]) {
       while (stop_requested.load(std::memory_order_relaxed) == 0 && !stop.stop_requested()) {
 #if defined(SIGHUP)
         if (reload_requested.exchange(0, std::memory_order_relaxed) != 0) {
+          bool loaded = false;
           try {
             auto replacement = load_snapshot(config, *logger, "reload", store->stats().index_size);
+            loaded = true;
             const std::size_t count = replacement->size();
             const std::size_t dimension = replacement->dimension();
             store->replace_index(std::move(replacement));
@@ -328,7 +329,15 @@ int main(const int argc, char* argv[]) {
                            .vector_count = count},
                           {{"dimension", static_cast<std::uint64_t>(dimension)}});
           } catch (...) {
-            // load_snapshot already logged a sanitized failure; retain the current index.
+            if (loaded) {
+              logger->write({.severity = "ERROR",
+                             .event = "index_replace_failed",
+                             .status = "INTERNAL",
+                             .index_type = config.index_type},
+                            {{"reason", std::string_view("snapshot_publication_failed")},
+                             {"kept_previous_index", true}});
+            }
+            // Load failures are logged by load_snapshot; either failure preserves the old index.
           }
         }
 #endif
