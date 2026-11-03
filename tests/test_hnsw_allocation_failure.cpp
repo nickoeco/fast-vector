@@ -9,7 +9,9 @@
 #include <new>
 #include <vector>
 
+#include "fast_vector/flat_index.h"
 #include "fast_vector/hnsw_index_io.h"
+#include "fast_vector/vector_store.h"
 
 namespace {
 thread_local std::ptrdiff_t allocations_left = -1;
@@ -138,6 +140,39 @@ TEST(HnswAllocationFailureTest, PruningAndTombstonesHaveStrongLogicalGuarantee) 
     ASSERT_TRUE(index.erase(2));
     ASSERT_TRUE(index.erase(7));
     verify_add_failures(index);
+  }
+}
+
+TEST(VectorStoreAllocationFailureTest, ControlBlockFailurePreservesPublishedSnapshot) {
+  for (const bool hnsw : {false, true}) {
+    const auto make_index = [hnsw]() -> std::unique_ptr<fast_vector::VectorIndex> {
+      if (hnsw) {
+        return std::make_unique<fast_vector::HnswIndex>(
+            fast_vector::HnswConfig{.dimension = 3, .max_connections = 2, .ef_construction = 8});
+      }
+      return std::make_unique<fast_vector::FlatIndex>(3);
+    };
+    auto original = make_index();
+    original->add(10, std::vector<float>{1, 0, 0});
+    fast_vector::VectorStore store(std::move(original), 10, true);
+    auto replacement = make_index();
+    replacement->add(20, std::vector<float>{1, 0, 0});
+    bool rejected = false;
+    try {
+      const FailAllocationsAfter failure(0);
+      store.replace_index(std::move(replacement));
+    } catch (const std::bad_alloc&) {
+      rejected = true;
+    }
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(store.stats().index_size, 1U);
+    const auto results = store.search(std::vector<float>{1, 0, 0}, 1);
+    ASSERT_EQ(results.size(), 1U);
+    EXPECT_EQ(results[0].id, 10U);
+    auto retry = make_index();
+    retry->add(30, std::vector<float>{1, 0, 0});
+    store.replace_index(std::move(retry));
+    EXPECT_EQ(store.search(std::vector<float>{1, 0, 0}, 1)[0].id, 30U);
   }
 }
 

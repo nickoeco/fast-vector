@@ -49,7 +49,9 @@ class VectorStore {
    */
   void add_batch(std::span<const VectorRecord> vectors);
 
-  /** Atomically replace the index owned by a read-only store. */
+  /** Publish an immutable snapshot without waiting for old read-only queries.
+   * Each query retains its snapshot until search completes. Requires a read-only store.
+   */
   void replace_index(std::unique_ptr<VectorIndex> index);
 
   [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k) const;
@@ -60,8 +62,17 @@ class VectorStore {
 
  private:
   void validate_batch(std::span<const VectorRecord> vectors) const;
+  [[nodiscard]] std::shared_ptr<const VectorIndex> acquire_snapshot() const;
+  void publish_snapshot(std::shared_ptr<const VectorIndex> snapshot);
 
-  std::unique_ptr<VectorIndex> index_;
+  // Exactly one ownership path is populated, determined by the immutable read_only_ flag.
+  std::unique_ptr<VectorIndex> writable_index_;
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+  std::atomic<std::shared_ptr<const VectorIndex>> snapshot_{nullptr};
+#else
+  // libstdc++ 11 lacks the C++20 specialization; access only through shared_ptr atomic APIs.
+  std::shared_ptr<const VectorIndex> snapshot_;
+#endif
   std::size_t maximum_batch_size_;
   const bool read_only_;
   mutable std::shared_mutex mutex_;
