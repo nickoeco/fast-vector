@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 
+#include "fast_vector/search_executor.h"
 #include "fast_vector/v1/vector_search.grpc.pb.h"
 #include "fast_vector/vector_store.h"
 #include "service/structured_logger.h"
@@ -20,8 +21,14 @@ inline constexpr char kVectorSearchServiceName[] = "fast_vector.v1.VectorSearchS
 class VectorSearchService final : public v1::VectorSearchService::Service {
  public:
   VectorSearchService(std::shared_ptr<VectorStore> store, std::string index_type,
-                      std::shared_ptr<StructuredLogger> logger = nullptr);
-  ~VectorSearchService() override { log_rpc_summary(); }
+                      std::shared_ptr<StructuredLogger> logger = nullptr,
+                      SearchExecutorConfig search_config = {});
+  ~VectorSearchService() override {
+    shutdown_searches();
+    log_rpc_summary();
+  }
+  void stop_searches() { executor_->stop(); }
+  void shutdown_searches() { executor_->shutdown(); }
 
   /** Emit final process-local handler status counts after all RPCs have drained. */
   void log_rpc_summary() noexcept;
@@ -49,6 +56,7 @@ class VectorSearchService final : public v1::VectorSearchService::Service {
   std::shared_ptr<VectorStore> store_;
   std::string index_type_;
   std::shared_ptr<StructuredLogger> logger_;
+  std::unique_ptr<SearchExecutor> executor_;
   std::atomic<std::uint64_t> next_request_id_{1};
   std::array<std::atomic<std::uint64_t>, 17> status_counts_{};
   std::atomic<bool> summary_logged_{false};

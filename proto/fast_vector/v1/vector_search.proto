@@ -36,6 +36,28 @@ message Neighbor {
 
 message SearchResponse {
   repeated Neighbor neighbors = 1;
+  uint64 snapshot_version = 2;
+  uint64 queue_us = 3;
+  uint64 execution_us = 4;
+}
+
+message SearchExecutorStats {
+  uint64 workers = 1;
+  uint64 queue_capacity = 2;
+  uint64 queued = 3;
+  uint64 running = 4;
+  uint64 peak_queued = 5;
+  uint64 peak_running = 6;
+  uint64 admitted = 7;
+  uint64 rejected = 8;
+  uint64 started = 9;
+  uint64 completed = 10;
+  uint64 succeeded = 11;
+  uint64 failed = 12;
+  uint64 cancelled = 13;
+  uint64 expired = 14;
+  uint64 queue_us_total = 15;
+  uint64 execution_us_total = 16;
 }
 
 message GetStatsRequest {}
@@ -48,6 +70,8 @@ message GetStatsResponse {
   uint64 failed_queries = 5;
   uint64 inserted_vectors = 6;
   bool read_only = 7;
+  SearchExecutorStats search_executor = 8;
+  uint64 snapshot_version = 9;
 }
 
 service VectorSearchService {

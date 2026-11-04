@@ -246,6 +246,7 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
         configuration = next(record for record in startup_records if record["event"] == "startup_config")
         self.assertEqual(configuration["config_source"], "snapshot")
         self.assertEqual(configuration["dimension"], 3)
+        self.assertEqual(self._client.stats().snapshot_version, 1)
 
         result = self._client.search([1.0, 0.0, 0.0], 3)
         self.assertEqual([neighbor.id for neighbor in result.neighbors], [101, 102, 103])
@@ -311,6 +312,8 @@ class SnapshotServerIntegrationTest(unittest.TestCase):
         self.assertEqual(reloaded_stats.dimension, 3)
         self.assertTrue(reloaded_stats.read_only)
         self.assertEqual(reloaded_stats.inserted_vectors, 0)
+        self.assertEqual(reloaded_stats.snapshot_version, 2)
+        self.assertEqual(reloaded.snapshot_version, 2)
 
         self._snapshot_path.write_bytes(b"corrupt snapshot")
         os.kill(self._server.pid, signal.SIGHUP)

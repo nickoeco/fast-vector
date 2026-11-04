@@ -3,9 +3,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "fast_vector/flat_index.h"
 #include "fast_vector/v1/vector_search.grpc.pb.h"
@@ -16,6 +18,7 @@ namespace {
 
 class GrpcServiceTest : public ::testing::Test {
  protected:
+  virtual fast_vector::SearchExecutorConfig search_config() { return {}; }
   virtual std::unique_ptr<fast_vector::VectorIndex> create_index() {
     return std::make_unique<fast_vector::FlatIndex>(2);
   }
@@ -23,7 +26,8 @@ class GrpcServiceTest : public ::testing::Test {
     auto index = create_index();
     store_ = std::make_shared<fast_vector::VectorStore>(std::move(index), 2);
     logger_ = std::make_shared<fast_vector::service::StructuredLogger>(logs_);
-    service_ = std::make_unique<fast_vector::service::VectorSearchService>(store_, "flat", logger_);
+    service_ = std::make_unique<fast_vector::service::VectorSearchService>(store_, "flat", logger_,
+                                                                           search_config());
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -235,6 +239,127 @@ TEST_F(InternalFailureGrpcTest, LogsInternalStatusWithoutExceptionMessage) {
   EXPECT_NE(logs_.str().find("\"status\":\"INTERNAL\""), std::string::npos);
   service_->log_rpc_summary();
   EXPECT_NE(logs_.str().find("\"failed_rpcs\":1"), std::string::npos);
+}
+
+struct RpcGate {
+  std::atomic<bool> released{false};
+  std::atomic<unsigned> calls{0};
+};
+
+class RpcControlledIndex final : public fast_vector::VectorIndex {
+ public:
+  explicit RpcControlledIndex(std::shared_ptr<RpcGate> gate) : gate_(std::move(gate)) {}
+  void add(fast_vector::VectorId, std::span<const float>) override {}
+  std::size_t size() const noexcept override { return 1; }
+  std::size_t dimension() const noexcept override { return 2; }
+  std::vector<fast_vector::SearchResult> search(std::span<const float> query,
+                                                std::size_t k) const override {
+    return search(query, k, fast_vector::SearchContext{});
+  }
+  std::vector<fast_vector::SearchResult> search(
+      std::span<const float> query, std::size_t,
+      const fast_vector::SearchContext& context) const override {
+    ++gate_->calls;
+    while (query[0] == 1 && !gate_->released.load()) {
+      context.check();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    context.check();
+    if (query[0] < 0) throw 7;  // Even a non-standard task exception must not escape the handler.
+    return {{42, 1.0F}};
+  }
+
+ private:
+  std::shared_ptr<RpcGate> gate_;
+};
+
+class ScheduledGrpcTest : public GrpcServiceTest {
+ protected:
+  fast_vector::SearchExecutorConfig search_config() override { return {1, 1, 1}; }
+  std::unique_ptr<fast_vector::VectorIndex> create_index() override {
+    return std::make_unique<RpcControlledIndex>(gate_);
+  }
+  void TearDown() override {
+    gate_->released.store(true);
+    service_->stop_searches();
+    GrpcServiceTest::TearDown();
+    service_->shutdown_searches();
+  }
+  fast_vector::v1::GetStatsResponse statistics() {
+    fast_vector::v1::GetStatsRequest request;
+    fast_vector::v1::GetStatsResponse response;
+    grpc::ClientContext context;
+#if !defined(FAST_VECTOR_GRPC_SYSTEM_LIBRARY_SANITIZER_BOUNDARY)
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+#endif
+    EXPECT_TRUE(stub_->GetStats(&context, request, &response).ok());
+    return response;
+  }
+  bool wait_for_queue(std::uint64_t queued, std::uint64_t running = 1) {
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < limit) {
+      auto stats = statistics().search_executor();
+      if (stats.queued() == queued && stats.running() == running) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+  }
+  std::future<grpc::Status> search_async(grpc::ClientContext& context, float value = 1) {
+#if !defined(FAST_VECTOR_GRPC_SYSTEM_LIBRARY_SANITIZER_BOUNDARY)
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+#endif
+    return std::async(std::launch::async, [&, value] {
+      fast_vector::v1::SearchRequest request;
+      request.add_query(value);
+      request.add_query(0);
+      request.set_k(1);
+      fast_vector::v1::SearchResponse response;
+      return stub_->Search(&context, request, &response);
+    });
+  }
+  std::shared_ptr<RpcGate> gate_ = std::make_shared<RpcGate>();
+};
+
+TEST_F(ScheduledGrpcTest, RejectsFullQueueCancelsWaitingRpcAndRecovers) {
+  grpc::ClientContext first_context, waiting_context, rejected_context;
+  auto first = search_async(first_context);
+  EXPECT_TRUE(wait_for_queue(0));
+  auto waiting = search_async(waiting_context, 2);
+  EXPECT_TRUE(wait_for_queue(1));
+  auto rejected = search_async(rejected_context, 2);
+  EXPECT_EQ(rejected.get().error_code(), grpc::StatusCode::RESOURCE_EXHAUSTED);
+  waiting_context.TryCancel();
+  EXPECT_EQ(waiting.get().error_code(), grpc::StatusCode::CANCELLED);
+  EXPECT_TRUE(wait_for_queue(0));
+  EXPECT_EQ(gate_->calls.load(), 1U);
+  first_context.TryCancel();
+  EXPECT_EQ(first.get().error_code(), grpc::StatusCode::CANCELLED);
+  EXPECT_TRUE(wait_for_queue(0, 0));
+  grpc::ClientContext failure_context, recovery_context;
+  EXPECT_EQ(search_async(failure_context, -1).get().error_code(), grpc::StatusCode::INTERNAL);
+  EXPECT_TRUE(search_async(recovery_context, 2).get().ok());
+  const auto stats = statistics().search_executor();
+  EXPECT_LE(stats.peak_running(), 1U);
+  EXPECT_LE(stats.peak_queued(), 1U);
+  EXPECT_EQ(stats.rejected(), 1U);
+  EXPECT_EQ(stats.cancelled(), 2U);
+}
+
+TEST_F(ScheduledGrpcTest, ShutdownSettlesQueuedAndActiveRpc) {
+  grpc::ClientContext first_context, waiting_context, later_context;
+  auto first = search_async(first_context);
+  EXPECT_TRUE(wait_for_queue(0));
+  auto waiting = search_async(waiting_context, 2);
+  EXPECT_TRUE(wait_for_queue(1));
+  service_->stop_searches();
+  service_->shutdown_searches();
+  EXPECT_EQ(first.get().error_code(), grpc::StatusCode::UNAVAILABLE);
+  EXPECT_EQ(waiting.get().error_code(), grpc::StatusCode::UNAVAILABLE);
+  EXPECT_EQ(search_async(later_context, 2).get().error_code(), grpc::StatusCode::UNAVAILABLE);
+  const auto stats = statistics().search_executor();
+  EXPECT_EQ(stats.queued(), 0U);
+  EXPECT_EQ(stats.running(), 0U);
+  EXPECT_EQ(stats.completed(), stats.admitted());
 }
 
 TEST_F(GrpcServiceTest, HonorsExpiredDeadline) {

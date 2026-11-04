@@ -65,6 +65,7 @@ struct ServerConfig {
   std::string load_index_path;
   bool read_only = false;
   bool reload_on_sighup = false;
+  fast_vector::SearchExecutorConfig search;
 };
 
 bool parse_bool(const std::string_view value, const std::string& option) {
@@ -113,6 +114,12 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
       config.dimension = parse_positive_size(value, option);
     } else if (option == "--max-batch-size") {
       config.maximum_batch_size = parse_positive_size(value, option);
+    } else if (option == "--search-workers") {
+      config.search.workers = parse_positive_size(value, option);
+    } else if (option == "--search-queue-capacity") {
+      config.search.queue_capacity = parse_positive_size(value, option);
+    } else if (option == "--search-check-interval") {
+      config.search.check_interval = parse_positive_size(value, option);
     } else if (option == "--max-message-bytes") {
       const std::uint64_t bytes = parse_unsigned(value, option);
       if (bytes == 0 || bytes > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
@@ -236,12 +243,13 @@ constexpr char kUsage[] =
     "[--kernel scalar|auto|avx2] [--m M] [--ef-construction N] "
     "[--ef-search N] [--hnsw-seed S] "
     "[--neighbor-selection simple|heuristic] [--load-index PATH] "
-    "[--read-only true|false] [--reload-on-sighup true|false]";
+    "[--read-only true|false] [--reload-on-sighup true|false] "
+    "[--search-workers N] [--search-queue-capacity N] [--search-check-interval N]";
 
 void log_config(const ServerConfig& config, const fast_vector::VectorIndex& index,
                 StructuredLogger& logger) {
   const auto* hnsw = dynamic_cast<const fast_vector::HnswIndex*>(&index);
-  const std::array<LogField, 12> fields{{
+  const std::array<LogField, 15> fields{{
       {"dimension", static_cast<std::uint64_t>(index.dimension())},
       {"kernel", std::string_view(fast_vector::dot_product_kernel_name(config.kernel))},
       {"read_only", config.read_only},
@@ -249,6 +257,9 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
       {"reload_on_sighup", config.reload_on_sighup},
       {"max_batch_size", static_cast<std::uint64_t>(config.maximum_batch_size)},
       {"max_message_bytes", static_cast<std::uint64_t>(config.maximum_message_bytes)},
+      {"search_workers", static_cast<std::uint64_t>(config.search.workers)},
+      {"search_queue_capacity", static_cast<std::uint64_t>(config.search.queue_capacity)},
+      {"search_check_interval", static_cast<std::uint64_t>(config.search.check_interval)},
       {"m", static_cast<std::uint64_t>(hnsw ? hnsw->config().max_connections : 0)},
       {"ef_construction", static_cast<std::uint64_t>(hnsw ? hnsw->config().ef_construction : 0)},
       {"ef_search", static_cast<std::uint64_t>(hnsw ? hnsw->config().ef_search : 0)},
@@ -263,7 +274,7 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
                 .status = "OK",
                 .index_type = config.index_type,
                 .vector_count = index.size()},
-               std::span<const LogField>(fields).first(hnsw ? 12 : 7));
+               std::span<const LogField>(fields).first(hnsw ? 15 : 10));
 }
 
 }  // namespace
@@ -284,7 +295,8 @@ int main(const int argc, char* argv[]) {
     log_config(config, *index, *logger);
     auto store = std::make_shared<fast_vector::VectorStore>(
         std::move(index), config.maximum_batch_size, config.read_only);
-    fast_vector::service::VectorSearchService vector_service(store, config.index_type, logger);
+    fast_vector::service::VectorSearchService vector_service(store, config.index_type, logger,
+                                                             config.search);
     if (stop_requested.load(std::memory_order_relaxed) != 0) {
       logger->write({.event = "shutdown_completed",
                      .status = "OK",
@@ -312,7 +324,8 @@ int main(const int argc, char* argv[]) {
       std::signal(SIGHUP, handle_reload_signal);
     }
 #endif
-    std::jthread shutdown_monitor([&config, &server, &store, &logger](std::stop_token stop) {
+    std::jthread shutdown_monitor([&config, &server, &store, &logger,
+                                   &vector_service](std::stop_token stop) {
       while (stop_requested.load(std::memory_order_relaxed) == 0 && !stop.stop_requested()) {
 #if defined(SIGHUP)
         if (reload_requested.exchange(0, std::memory_order_relaxed) != 0) {
@@ -345,7 +358,9 @@ int main(const int argc, char* argv[]) {
       }
       logger->write({.event = "shutdown_requested", .index_type = config.index_type},
                     {{"reason", shutdown_reason()}});
+      vector_service.stop_searches();
       server->Shutdown();
+      vector_service.shutdown_searches();
     });
 
     const fast_vector::StoreStats stats = store->stats();

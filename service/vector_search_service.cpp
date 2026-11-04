@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "fast_vector/distance.h"
+
 namespace fast_vector::service {
 namespace {
 constexpr std::array<std::string_view, 17> kStatusNames{
@@ -17,7 +19,8 @@ constexpr std::array<std::string_view, 17> kStatusNames{
 }
 
 VectorSearchService::VectorSearchService(std::shared_ptr<VectorStore> store, std::string index_type,
-                                         std::shared_ptr<StructuredLogger> logger)
+                                         std::shared_ptr<StructuredLogger> logger,
+                                         SearchExecutorConfig search_config)
     : store_(std::move(store)), index_type_(std::move(index_type)), logger_(std::move(logger)) {
   if (store_ == nullptr) {
     throw std::invalid_argument("gRPC vector service requires a vector store");
@@ -25,6 +28,7 @@ VectorSearchService::VectorSearchService(std::shared_ptr<VectorStore> store, std
   if (index_type_.empty()) {
     throw std::invalid_argument("gRPC vector service requires an index type");
   }
+  executor_ = std::make_unique<SearchExecutor>(store_, search_config);
 }
 
 VectorSearchService::RpcCall VectorSearchService::begin_rpc(
@@ -45,7 +49,7 @@ grpc::Status VectorSearchService::finish_rpc(const RpcCall& call, grpc::Status s
                              .count();
     std::optional<std::uint64_t> count;
     try {
-      count = store_->stats().index_size;
+      count = store_->try_size();
     } catch (...) {
       // Observability must not replace the original handler outcome.
     }
@@ -94,6 +98,20 @@ void VectorSearchService::log_rpc_summary() noexcept {
                   {"successful_rpcs", successful},
                   {"failed_rpcs", errors},
                   {"dropped_log_records", logger_->dropped_records()}});
+  const auto scheduler = executor_->stats();
+  logger_->write(
+      {.event = "search_executor_summary", .index_type = index_type_, .vector_count = count},
+      {{"admitted", scheduler.admitted},
+       {"rejected", scheduler.rejected},
+       {"completed", scheduler.completed},
+       {"succeeded", scheduler.succeeded},
+       {"failed", scheduler.failed},
+       {"cancelled", scheduler.cancelled},
+       {"expired", scheduler.expired},
+       {"peak_queued", static_cast<std::uint64_t>(scheduler.peak_queued)},
+       {"peak_running", static_cast<std::uint64_t>(scheduler.peak_running)},
+       {"queue_us_total", scheduler.queue_us_total},
+       {"execution_us_total", scheduler.execution_us_total}});
 }
 
 grpc::Status VectorSearchService::AddVector(grpc::ServerContext* context,
@@ -148,19 +166,50 @@ grpc::Status VectorSearchService::Search(grpc::ServerContext* context,
     return finish_rpc(call, cancelled_status(*context));
   }
   try {
-    const std::vector<SearchResult> results = store_->search(
-        std::span<const float>(request->query().data(), request->query().size()), request->k());
+    const auto query = std::span<const float>(request->query().data(), request->query().size());
+    if (request->k() != 0) {
+      if (query.size() != store_->dimension()) {
+        throw std::invalid_argument("query dimension does not match index dimension");
+      }
+      (void)normalize_l2(query);
+    }
+    auto deadline = SearchContext::Clock::time_point::max();
+    if (context->deadline() != std::chrono::system_clock::time_point::max()) {
+      const auto remaining = context->deadline() - std::chrono::system_clock::now();
+      const auto now = SearchContext::Clock::now();
+      if (remaining <= decltype(remaining)::zero()) {
+        return finish_rpc(call, {grpc::StatusCode::DEADLINE_EXCEEDED, "request deadline exceeded"});
+      }
+      if (remaining < deadline - now) deadline = now + remaining;
+    }
+    auto ticket =
+        executor_->submit(std::vector<float>(query.begin(), query.end()), request->k(), deadline);
+    while (ticket.future.wait_for(std::chrono::milliseconds(2)) != std::future_status::ready) {
+      if (context->IsCancelled()) {
+        executor_->cancel(ticket.cancellation,
+                          std::chrono::system_clock::now() >= context->deadline()
+                              ? SearchStopReason::DeadlineExceeded
+                              : SearchStopReason::Cancelled);
+      }
+    }
+    auto outcome = ticket.future.get();
+    if (outcome.error) std::rethrow_exception(outcome.error);
     if (context->IsCancelled()) {
       return finish_rpc(call, cancelled_status(*context));
     }
-    for (const SearchResult& result : results) {
+    for (const SearchResult& result : outcome.result.neighbors) {
       v1::Neighbor* neighbor = response->add_neighbors();
       neighbor->set_id(result.id);
       neighbor->set_score(result.score);
     }
+    response->set_snapshot_version(outcome.result.snapshot_version);
+    response->set_queue_us(outcome.queue_us);
+    response->set_execution_us(outcome.execution_us);
     return finish_rpc(call, grpc::Status::OK);
   } catch (const std::exception& error) {
     return finish_rpc(call, exception_status(error));
+  } catch (...) {
+    return finish_rpc(call, {grpc::StatusCode::INTERNAL, "internal vector service error"});
   }
 }
 
@@ -179,6 +228,25 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     response->set_failed_queries(stats.failed_queries);
     response->set_inserted_vectors(stats.inserted_vectors);
     response->set_read_only(stats.read_only);
+    response->set_snapshot_version(stats.snapshot_version);
+    const auto scheduler = executor_->stats();
+    auto* scheduling = response->mutable_search_executor();
+    scheduling->set_workers(scheduler.workers);
+    scheduling->set_queue_capacity(scheduler.queue_capacity);
+    scheduling->set_queued(scheduler.queued);
+    scheduling->set_running(scheduler.running);
+    scheduling->set_peak_queued(scheduler.peak_queued);
+    scheduling->set_peak_running(scheduler.peak_running);
+    scheduling->set_admitted(scheduler.admitted);
+    scheduling->set_rejected(scheduler.rejected);
+    scheduling->set_started(scheduler.started);
+    scheduling->set_completed(scheduler.completed);
+    scheduling->set_succeeded(scheduler.succeeded);
+    scheduling->set_failed(scheduler.failed);
+    scheduling->set_cancelled(scheduler.cancelled);
+    scheduling->set_expired(scheduler.expired);
+    scheduling->set_queue_us_total(scheduler.queue_us_total);
+    scheduling->set_execution_us_total(scheduler.execution_us_total);
     return finish_rpc(call, grpc::Status::OK);
   } catch (const std::exception& error) {
     return finish_rpc(call, exception_status(error));
@@ -193,6 +261,21 @@ grpc::Status VectorSearchService::cancelled_status(const grpc::ServerContext& co
 }
 
 grpc::Status VectorSearchService::exception_status(const std::exception& error) {
+  if (const auto* rejected = dynamic_cast<const SearchRejected*>(&error)) {
+    return {
+        rejected->stopping() ? grpc::StatusCode::UNAVAILABLE : grpc::StatusCode::RESOURCE_EXHAUSTED,
+        rejected->stopping() ? "search executor stopping" : "search queue full"};
+  }
+  if (const auto* interrupted = dynamic_cast<const SearchInterrupted*>(&error)) {
+    switch (interrupted->reason()) {
+      case SearchStopReason::DeadlineExceeded:
+        return {grpc::StatusCode::DEADLINE_EXCEEDED, "search deadline exceeded"};
+      case SearchStopReason::Shutdown:
+        return {grpc::StatusCode::UNAVAILABLE, "search executor stopping"};
+      default:
+        return {grpc::StatusCode::CANCELLED, "search cancelled"};
+    }
+  }
   if (dynamic_cast<const ReadOnlyStoreError*>(&error) != nullptr) {
     return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
   }
