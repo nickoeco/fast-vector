@@ -113,6 +113,15 @@ final-reference release performs destruction. Automatic saving and writable hot 
 The default container and Kubernetes commands still start with an empty index unless an operator
 mounts a snapshot and supplies the loading arguments.
 
+## Search scheduling
+
+Search handlers validate/copy input and submit owned tasks to a fixed-size computation pool
+with bounded waiting capacity. Workers acquire snapshots only on execution. Flat/HNSW cooperate
+through `SearchContext` batch checks; transport contexts remain in handlers. Shutdown refuses
+Search admission, cancels waiting/active tasks, drains gRPC and joins workers. Insertions retain
+their direct path. An immutable publication bundles its index with a process-local version
+returned by Search. See [service concurrency](service_concurrency.md) for timing and limitations.
+
 ## Structured service logs
 
 The optional gRPC target owns a shared JSON Lines writer on stderr. Application handlers emit

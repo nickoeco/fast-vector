@@ -262,8 +262,15 @@ Start an empty HNSW-backed server with a fixed dimension:
 ```
 
 Use `--index flat` for exact search; HNSW-only options are then ignored. The synchronous
-server lets gRPC schedule independent requests concurrently. `VectorStore` permits concurrent
-searches but serializes each insertion or batch against all other operations. RPC input errors
+server validates Search requests and dispatches owned tasks to a bounded computation queue.
+`--search-workers` (default 2), `--search-queue-capacity` (default 64), and
+`--search-check-interval` (default 64) configure workers, waiting capacity and cancellation checks.
+A full queue returns `RESOURCE_EXHAUSTED`; shutdown cancels queued/active searches. Waiting
+synchronous handlers still occupy gRPC threads. Insertion retains its direct path. Responses
+include queue/execution times and the actual process-local snapshot version; `GetStats` exposes
+scheduler counters. See [service concurrency](docs/service_concurrency.md) for lifecycle,
+measurement commands and limitations. `VectorStore` serializes each insertion or batch against
+other writable-store operations. RPC input errors
 map to `INVALID_ARGUMENT`, oversized configured batches to `RESOURCE_EXHAUSTED`, and expired
 deadlines to `DEADLINE_EXCEEDED`. Writes to a read-only store map to `FAILED_PRECONDITION`.
 Message size is bounded separately by

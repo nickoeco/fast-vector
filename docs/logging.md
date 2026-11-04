@@ -31,6 +31,9 @@ Request IDs restart with the process and do not use client headers. Concurrent c
 records may appear in a different order from their IDs. Wall-clock timestamps are for
 correlation; elapsed times remain valid across wall-clock adjustments. Vector counts are
 observations, not a transactional view tied to the individual request.
+RPC logging only attempts to observe a writable index's vector count; it emits `null` when a
+writer owns the store lock, so logging metadata does not wait behind insertion. The sink itself
+can still block.
 
 ## Events
 
@@ -47,6 +50,7 @@ observations, not a transactional view tied to the individual request.
 | `shutdown_requested` | Reason: `SIGINT`, `SIGTERM`, or `internal_stop` |
 | `rpc_error_summary` | One record per nonzero error-status count: status, numeric code, `count` |
 | `rpc_summary` | `completed_rpcs`, `successful_rpcs`, `failed_rpcs`, `dropped_log_records` |
+| `search_executor_summary` | Admission, rejection, terminal counts, queue/running high-water marks, and total queue/execution microseconds |
 | `shutdown_completed` | Shutdown reason and final vector count after requests drain |
 | `startup_failed`, `server_failed` | Sanitized phase/reason and static command usage |
 
