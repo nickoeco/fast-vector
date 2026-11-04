@@ -85,6 +85,13 @@ bool FlatIndex::erase(const VectorId id) {
 
 std::vector<SearchResult> FlatIndex::search(const std::span<const float> query,
                                             const std::size_t k) const {
+  return search(query, k, SearchContext{});
+}
+
+std::vector<SearchResult> FlatIndex::search(const std::span<const float> query, const std::size_t k,
+                                            const SearchContext& context) const {
+  context.validate();
+  context.check();
   if (k == 0) {
     return {};
   }
@@ -100,7 +107,9 @@ std::vector<SearchResult> FlatIndex::search(const std::span<const float> query,
   }
 
   std::priority_queue<SearchResult, std::vector<SearchResult>, BetterResult> candidates;
+  std::size_t remaining = 0;
   for (std::size_t i = 0; i < size(); ++i) {
+    context.checkpoint(remaining);
     const std::span<const float> stored_vector(vectors_.data() + i * dimension_, dimension_);
     const SearchResult candidate{
         ids_[i], dot_product_kernel(normalized_query.data(), stored_vector.data(), dimension_)};
@@ -116,10 +125,12 @@ std::vector<SearchResult> FlatIndex::search(const std::span<const float> query,
   std::vector<SearchResult> results;
   results.reserve(result_count);
   while (!candidates.empty()) {
+    context.checkpoint(remaining);
     results.push_back(candidates.top());
     candidates.pop();
   }
   std::sort(results.begin(), results.end(), is_better);
+  context.check();
   return results;
 }
 

@@ -1,5 +1,6 @@
 #include "fast_vector/vector_store.h"
 
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_set>
@@ -57,7 +58,7 @@ void VectorStore::replace_index(std::unique_ptr<VectorIndex> index) {
   publish_snapshot(std::move(replacement));
 }
 
-std::shared_ptr<const VectorIndex> VectorStore::acquire_snapshot() const {
+std::shared_ptr<const VectorStore::IndexSnapshot> VectorStore::acquire_snapshot() const {
 #if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
   return snapshot_.load(std::memory_order_acquire);
 #else
@@ -66,26 +67,51 @@ std::shared_ptr<const VectorIndex> VectorStore::acquire_snapshot() const {
 }
 
 void VectorStore::publish_snapshot(std::shared_ptr<const VectorIndex> snapshot) {
+  // Publish version and index in one immutable object, never as separate atomics.
+  std::lock_guard lock(publication_mutex_);
+  const auto previous = acquire_snapshot();
+  const auto version = previous ? previous->version : 0;
+  if (version == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::length_error("snapshot version exhausted");
+  }
+  std::shared_ptr<const IndexSnapshot> publication =
+      std::make_shared<IndexSnapshot>(IndexSnapshot{std::move(snapshot), version + 1});
 #if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
-  snapshot_.store(std::move(snapshot), std::memory_order_release);
+  snapshot_.store(std::move(publication), std::memory_order_release);
 #else
-  std::atomic_store_explicit(&snapshot_, std::move(snapshot), std::memory_order_release);
+  std::atomic_store_explicit(&snapshot_, std::move(publication), std::memory_order_release);
 #endif
 }
 
 std::vector<SearchResult> VectorStore::search(const std::span<const float> query,
                                               const std::size_t k) const {
+  return search(query, k, SearchContext{}).neighbors;
+}
+
+SnapshotSearchResult VectorStore::search(const std::span<const float> query, const std::size_t k,
+                                         const SearchContext& context) const {
   try {
+    context.validate();
+    context.check();
     std::vector<SearchResult> results;
+    std::uint64_t version = 0;
     if (read_only_) {
       const auto snapshot = acquire_snapshot();
-      results = snapshot->search(query, k);
+      version = snapshot->version;
+      results = snapshot->index->search(query, k, context);
     } else {
-      std::shared_lock lock(mutex_);
-      results = writable_index_->search(query, k);
+      std::shared_lock lock(mutex_, std::defer_lock);
+      if (context.enabled()) {
+        while (!lock.try_lock_for(std::chrono::milliseconds(2))) context.check();
+      } else {
+        lock.lock();
+      }
+      context.check();
+      results = writable_index_->search(query, k, context);
     }
+    context.check();
     successful_queries_.fetch_add(1, std::memory_order_relaxed);
-    return results;
+    return {std::move(results), version};
   } catch (...) {
     failed_queries_.fetch_add(1, std::memory_order_relaxed);
     throw;
@@ -93,7 +119,7 @@ std::vector<SearchResult> VectorStore::search(const std::span<const float> query
 }
 
 StoreStats VectorStore::stats() const {
-  const auto observe = [this](const VectorIndex& index) {
+  const auto observe = [this](const VectorIndex& index, const std::uint64_t version) {
     return StoreStats{
         index.size(),
         index.dimension(),
@@ -101,17 +127,31 @@ StoreStats VectorStore::stats() const {
         failed_queries_.load(std::memory_order_relaxed),
         inserted_vectors_.load(std::memory_order_relaxed),
         read_only_,
+        version,
     };
   };
   if (read_only_) {
     const auto snapshot = acquire_snapshot();
-    return observe(*snapshot);
+    return observe(*snapshot->index, snapshot->version);
   }
   std::shared_lock lock(mutex_);
-  return observe(*writable_index_);
+  return observe(*writable_index_, 0);
 }
 
 std::size_t VectorStore::maximum_batch_size() const noexcept { return maximum_batch_size_; }
+
+std::size_t VectorStore::dimension() const {
+  if (read_only_) return acquire_snapshot()->index->dimension();
+  // VectorIndex's fixed-dimension contract makes this independent of insertions.
+  return writable_index_->dimension();
+}
+
+std::optional<std::size_t> VectorStore::try_size() const {
+  if (read_only_) return acquire_snapshot()->index->size();
+  std::shared_lock lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return std::nullopt;
+  return writable_index_->size();
+}
 
 bool VectorStore::read_only() const noexcept { return read_only_; }
 

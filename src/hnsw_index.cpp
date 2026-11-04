@@ -233,6 +233,19 @@ std::vector<SearchResult> HnswIndex::search(const std::span<const float> query,
 
 std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, const std::size_t k,
                                             const std::size_t ef_search) const {
+  return search(query, k, ef_search, SearchContext{});
+}
+
+std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, const std::size_t k,
+                                            const SearchContext& context) const {
+  return search(query, k, config_.ef_search, context);
+}
+
+std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, const std::size_t k,
+                                            const std::size_t ef_search,
+                                            const SearchContext& context) const {
+  context.validate();
+  context.check();
   if (k == 0) {
     return {};
   }
@@ -250,21 +263,25 @@ std::vector<SearchResult> HnswIndex::search(const std::span<const float> query, 
 
   NodeIndex entry = entry_point_;
   for (std::size_t level = max_level_; level > 0; --level) {
-    entry = greedy_search_layer(normalized, entry, level);
+    entry = greedy_search_layer(normalized, entry, level, context);
   }
 
   const std::size_t result_count = std::min(k, size());
   const std::size_t effective_ef = std::max(result_count, ef_search);
-  std::vector<Candidate> candidates = search_layer(normalized, entry, effective_ef, 0, true);
+  std::vector<Candidate> candidates =
+      search_layer(normalized, entry, effective_ef, 0, true, context);
   if (candidates.size() > result_count) {
     candidates.resize(result_count);
   }
 
   std::vector<SearchResult> results;
   results.reserve(candidates.size());
+  std::size_t remaining = 0;
   for (const Candidate& candidate : candidates) {
+    context.checkpoint(remaining);
     results.push_back(SearchResult{ids_[candidate.node], candidate.score});
   }
+  context.check();
   return results;
 }
 
@@ -310,13 +327,15 @@ float HnswIndex::similarity(const std::span<const float> query, const NodeIndex 
 }
 
 HnswIndex::NodeIndex HnswIndex::greedy_search_layer(const std::span<const float> query,
-                                                    NodeIndex entry,
-                                                    const std::size_t level) const {
+                                                    NodeIndex entry, const std::size_t level,
+                                                    const SearchContext& context) const {
+  std::size_t remaining = 0;
   Candidate best{entry, similarity(query, entry)};
   bool improved = true;
   while (improved) {
     improved = false;
     for (const NodeIndex neighbor : graph_[best.node].levels[level]) {
+      context.checkpoint(remaining);
       const Candidate candidate{neighbor, similarity(query, neighbor)};
       if (is_better(candidate, best)) {
         best = candidate;
@@ -327,11 +346,11 @@ HnswIndex::NodeIndex HnswIndex::greedy_search_layer(const std::span<const float>
   return best.node;
 }
 
-std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const float> query,
-                                                          const NodeIndex entry,
-                                                          const std::size_t ef,
-                                                          const std::size_t level,
-                                                          const bool live_only) const {
+std::vector<HnswIndex::Candidate> HnswIndex::search_layer(
+    const std::span<const float> query, const NodeIndex entry, const std::size_t ef,
+    const std::size_t level, const bool live_only, const SearchContext& context) const {
+  context.check();
+  std::size_t remaining = 0;
   const auto better = [this](const Candidate& lhs, const Candidate& rhs) {
     return is_better(lhs, rhs);
   };
@@ -350,6 +369,7 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const 
   visited[entry] = true;
 
   while (!pending.empty()) {
+    context.checkpoint(remaining);
     const Candidate current = pending.top();
     if (best.size() >= ef && is_better(best.top(), current)) {
       break;
@@ -357,6 +377,7 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const 
     pending.pop();
 
     for (const NodeIndex neighbor : graph_[current.node].levels[level]) {
+      context.checkpoint(remaining);
       if (visited[neighbor]) {
         continue;
       }
@@ -379,6 +400,7 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const std::span<const 
   std::vector<Candidate> result;
   result.reserve(best.size());
   while (!best.empty()) {
+    context.checkpoint(remaining);
     result.push_back(best.top());
     best.pop();
   }

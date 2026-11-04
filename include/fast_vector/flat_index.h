@@ -26,6 +26,8 @@ class FlatIndex final : public VectorIndex {
                                                  std::size_t k) const override;
 
   [[nodiscard]] std::size_t size() const noexcept override;
+  [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
+                                                 const SearchContext& context) const override;
   [[nodiscard]] std::size_t dimension() const noexcept override;
   [[nodiscard]] DotProductKernel kernel() const noexcept;
 

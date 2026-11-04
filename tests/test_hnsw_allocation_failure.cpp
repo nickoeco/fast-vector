@@ -155,16 +155,19 @@ TEST(VectorStoreAllocationFailureTest, ControlBlockFailurePreservesPublishedSnap
     auto original = make_index();
     original->add(10, std::vector<float>{1, 0, 0});
     fast_vector::VectorStore store(std::move(original), 10, true);
-    auto replacement = make_index();
-    replacement->add(20, std::vector<float>{1, 0, 0});
-    bool rejected = false;
-    try {
-      const FailAllocationsAfter failure(0);
-      store.replace_index(std::move(replacement));
-    } catch (const std::bad_alloc&) {
-      rejected = true;
+    for (const std::ptrdiff_t point : {0, 1}) {
+      auto replacement = make_index();
+      replacement->add(20, std::vector<float>{1, 0, 0});
+      bool rejected = false;
+      try {
+        const FailAllocationsAfter failure(point);
+        store.replace_index(std::move(replacement));
+      } catch (const std::bad_alloc&) {
+        rejected = true;
+      }
+      ASSERT_TRUE(rejected);
+      EXPECT_EQ(store.stats().snapshot_version, 1U);
     }
-    ASSERT_TRUE(rejected);
     EXPECT_EQ(store.stats().index_size, 1U);
     const auto results = store.search(std::vector<float>{1, 0, 0}, 1);
     ASSERT_EQ(results.size(), 1U);

@@ -70,6 +70,12 @@ class HnswIndex final : public VectorIndex {
   [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
                                                  std::size_t ef_search) const;
 
+  /** Cooperative search with a per-request deadline and cancellation state. */
+  [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
+                                                 const SearchContext& context) const override;
+  [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
+                                                 std::size_t ef_search,
+                                                 const SearchContext& context) const;
   /** Number of live vectors, excluding tombstones. */
   [[nodiscard]] std::size_t size() const noexcept override;
   [[nodiscard]] std::size_t dimension() const noexcept override;
@@ -96,10 +102,12 @@ class HnswIndex final : public VectorIndex {
   [[nodiscard]] bool is_better(const Candidate& lhs, const Candidate& rhs) const;
   [[nodiscard]] float similarity(std::span<const float> query, NodeIndex node) const;
   [[nodiscard]] NodeIndex greedy_search_layer(std::span<const float> query, NodeIndex entry,
-                                              std::size_t level) const;
+                                              std::size_t level,
+                                              const SearchContext& context = {}) const;
   [[nodiscard]] std::vector<Candidate> search_layer(std::span<const float> query, NodeIndex entry,
                                                     std::size_t ef, std::size_t level,
-                                                    bool live_only = false) const;
+                                                    bool live_only = false,
+                                                    const SearchContext& context = {}) const;
   [[nodiscard]] std::vector<NodeIndex> select_neighbors(const std::vector<Candidate>& candidates,
                                                         std::size_t maximum_count) const;
   [[nodiscard]] std::size_t maximum_connections(std::size_t level) const noexcept;

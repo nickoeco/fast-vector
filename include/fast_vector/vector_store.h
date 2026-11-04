@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <stdexcept>
@@ -27,6 +29,13 @@ struct StoreStats {
   std::uint64_t failed_queries;
   std::uint64_t inserted_vectors;
   bool read_only;
+  std::uint64_t snapshot_version;
+};
+
+struct SnapshotSearchResult {
+  std::vector<SearchResult> neighbors;
+  // Process-local publication sequence; zero identifies the mutable ownership path.
+  std::uint64_t snapshot_version;
 };
 
 /** Raised when a mutating operation targets a read-only store. */
@@ -55,27 +64,38 @@ class VectorStore {
   void replace_index(std::unique_ptr<VectorIndex> index);
 
   [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k) const;
+  [[nodiscard]] SnapshotSearchResult search(std::span<const float> query, std::size_t k,
+                                            const SearchContext& context) const;
 
   [[nodiscard]] StoreStats stats() const;
+  /** Fixed for writable indexes; snapshot-local for read-only stores. Does not await a writer. */
+  [[nodiscard]] std::size_t dimension() const;
+  /** Best-effort metadata for logging; nullopt if a writable index is busy. */
+  [[nodiscard]] std::optional<std::size_t> try_size() const;
   [[nodiscard]] std::size_t maximum_batch_size() const noexcept;
   [[nodiscard]] bool read_only() const noexcept;
 
  private:
   void validate_batch(std::span<const VectorRecord> vectors) const;
-  [[nodiscard]] std::shared_ptr<const VectorIndex> acquire_snapshot() const;
+  struct IndexSnapshot {
+    std::shared_ptr<const VectorIndex> index;
+    std::uint64_t version;
+  };
+  [[nodiscard]] std::shared_ptr<const IndexSnapshot> acquire_snapshot() const;
   void publish_snapshot(std::shared_ptr<const VectorIndex> snapshot);
 
   // Exactly one ownership path is populated, determined by the immutable read_only_ flag.
   std::unique_ptr<VectorIndex> writable_index_;
 #if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
-  std::atomic<std::shared_ptr<const VectorIndex>> snapshot_{nullptr};
+  std::atomic<std::shared_ptr<const IndexSnapshot>> snapshot_{nullptr};
 #else
   // libstdc++ 11 lacks the C++20 specialization; access only through shared_ptr atomic APIs.
-  std::shared_ptr<const VectorIndex> snapshot_;
+  std::shared_ptr<const IndexSnapshot> snapshot_;
 #endif
   std::size_t maximum_batch_size_;
   const bool read_only_;
-  mutable std::shared_mutex mutex_;
+  mutable std::shared_timed_mutex mutex_;
+  std::mutex publication_mutex_;
   mutable std::atomic<std::uint64_t> successful_queries_{0};
   mutable std::atomic<std::uint64_t> failed_queries_{0};
   std::atomic<std::uint64_t> inserted_vectors_{0};
