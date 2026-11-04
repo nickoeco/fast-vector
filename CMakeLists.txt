@@ -26,6 +26,7 @@ add_library(fast_vector
     src/hnsw_index_io.cpp
     src/hnsw_index_publish.cpp
     src/vector_store.cpp
+    src/search_executor.cpp
 )
 add_library(fast_vector::fast_vector ALIAS fast_vector)
 
@@ -121,6 +122,7 @@ if(FAST_VECTOR_BUILD_TESTS)
         tests/test_hnsw_index_io.cpp
         tests/test_vector_jsonl.cpp
         tests/test_vector_store.cpp
+        tests/test_search_executor.cpp
         tools/vector_jsonl.cpp
     )
     target_include_directories(fast_vector_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
