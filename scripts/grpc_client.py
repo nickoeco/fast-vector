@@ -70,8 +70,8 @@ class VectorSearchClient:
         )
         return self._stub.BatchAdd(request, timeout=self._timeout_seconds)
 
-    def search(self, query: Sequence[float], k: int):
-        request = self._messages.SearchRequest(query=query, k=k)
+    def search(self, query: Sequence[float], k: int, expected_snapshot_id: str = ""):
+        request = self._messages.SearchRequest(query=query, k=k, expected_snapshot_id=expected_snapshot_id)
         return self._stub.Search(request, timeout=self._timeout_seconds)
 
     def stats(self):
@@ -124,6 +124,7 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     search_parser = subparsers.add_parser("search")
     search_parser.add_argument("--query", type=parse_vector, required=True)
     search_parser.add_argument("--k", type=int, required=True)
+    search_parser.add_argument("--expected-snapshot-id", default="")
 
     subparsers.add_parser("stats")
     return parser.parse_args(arguments)
@@ -139,7 +140,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             vectors = [(record["id"], record["values"]) for record in records]
             response = client.add_batch(vectors)
         elif options.command == "search":
-            response = client.search(options.query, options.k)
+            response = client.search(options.query, options.k, options.expected_snapshot_id)
         else:
             response = client.stats()
     print(json.dumps(response_to_dictionary(response), indent=2, sort_keys=True))

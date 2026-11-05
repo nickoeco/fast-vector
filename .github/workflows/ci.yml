@@ -85,7 +85,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends \
-            protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev
+            protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev libssl-dev
       - name: Configure
         run: |
           cmake -S . -B build-grpc \
@@ -103,9 +103,18 @@ jobs:
         env:
           FAST_VECTOR_BUILDER: build-grpc/fast_vector_build_index
           FAST_VECTOR_SERVER: build-grpc/fast_vector_server
+          FAST_VECTOR_PUBLICATION_REPORT_DIR: build/publication-11b
         run: |
           python -m unittest -v tests/grpc_python_test.py
           python -m unittest -v tests/semantic_search_test.py
+          python -m unittest -v tests/snapshot_publication_test.py
+      - name: Upload snapshot publication reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-publication-reports
+          path: build/publication-11b
+          if-no-files-found: ignore
 
   docker-build:
     runs-on: ubuntu-latest
