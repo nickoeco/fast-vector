@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         libgrpc++-dev \
         libprotobuf-dev \
+        libssl-dev \
         pkg-config \
         protobuf-compiler \
         protobuf-compiler-grpc \
@@ -38,6 +39,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libgrpc++1 \
+        libssl3 \
         libprotobuf23 \
         netcat-openbsd \
     && rm -rf /var/lib/apt/lists/* \

@@ -66,6 +66,10 @@ struct ServerConfig {
   bool read_only = false;
   bool reload_on_sighup = false;
   fast_vector::SearchExecutorConfig search;
+  fast_vector::service::PublicationConfig publication;
+  std::string snapshot_manifest_path;
+  std::uint64_t generation = 0;
+  std::optional<fast_vector::v1::SnapshotManifest> manifest;
 };
 
 bool parse_bool(const std::string_view value, const std::string& option) {
@@ -159,6 +163,16 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
       }
     } else if (option == "--read-only") {
       config.read_only = parse_bool(value, option);
+    } else if (option == "--snapshot-manifest") {
+      config.snapshot_manifest_path = value;
+    } else if (option == "--generation") {
+      config.generation = parse_unsigned(value, option);
+    } else if (option == "--enable-snapshot-publication") {
+      config.publication.enabled = parse_bool(value, option);
+    } else if (option == "--max-snapshot-bytes") {
+      config.publication.maximum_file_bytes = parse_positive_size(value, option);
+    } else if (option == "--snapshot-staging-dir") {
+      config.publication.staging_directory = value;
     } else if (option == "--reload-on-sighup") {
       config.reload_on_sighup = parse_bool(value, option);
     } else {
@@ -167,6 +181,17 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
   }
   if (config.address.empty()) {
     throw std::invalid_argument("--address must not be empty");
+  }
+  config.publication.kernel = config.kernel;
+  if ((!config.snapshot_manifest_path.empty() || config.generation != 0 ||
+       config.publication.enabled) &&
+      (config.snapshot_manifest_path.empty() || config.generation == 0 || !config.read_only ||
+       config.load_index_path.empty() || config.reload_on_sighup)) {
+    throw std::invalid_argument(
+        "managed publication requires read-only snapshot, manifest, generation and no SIGHUP");
+  }
+  if (!config.snapshot_manifest_path.empty()) {
+    config.manifest = fast_vector::service::read_snapshot_manifest(config.snapshot_manifest_path);
   }
   if (config.reload_on_sighup && (config.load_index_path.empty() || !config.read_only)) {
     throw std::invalid_argument(
@@ -189,7 +214,18 @@ std::unique_ptr<fast_vector::VectorIndex> load_snapshot(
   const auto start = std::chrono::steady_clock::now();
   try {
     std::unique_ptr<fast_vector::VectorIndex> index;
-    if (config.index_type == "flat") {
+    if (!config.snapshot_manifest_path.empty()) {
+      fast_vector::service::SnapshotStagingFile staging(config.publication.staging_directory);
+      if (std::filesystem::file_size(config.load_index_path) >
+          config.publication.maximum_file_bytes) {
+        throw std::invalid_argument("snapshot exceeds file limit");
+      }
+      std::filesystem::copy_file(config.load_index_path, staging.path(),
+                                 std::filesystem::copy_options::overwrite_existing);
+      index = fast_vector::service::load_verified_snapshot(staging.path(), *config.manifest,
+                                                           config.index_type, config.kernel,
+                                                           config.publication.maximum_file_bytes);
+    } else if (config.index_type == "flat") {
       index = std::make_unique<fast_vector::FlatIndex>(
           fast_vector::load_flat_index(config.load_index_path, config.kernel));
     } else {
@@ -244,12 +280,14 @@ constexpr char kUsage[] =
     "[--ef-search N] [--hnsw-seed S] "
     "[--neighbor-selection simple|heuristic] [--load-index PATH] "
     "[--read-only true|false] [--reload-on-sighup true|false] "
-    "[--search-workers N] [--search-queue-capacity N] [--search-check-interval N]";
+    "[--search-workers N] [--search-queue-capacity N] [--search-check-interval N] "
+    "[--snapshot-manifest PATH] [--generation G] [--enable-snapshot-publication true|false] "
+    "[--max-snapshot-bytes N] [--snapshot-staging-dir PATH]";
 
 void log_config(const ServerConfig& config, const fast_vector::VectorIndex& index,
                 StructuredLogger& logger) {
   const auto* hnsw = dynamic_cast<const fast_vector::HnswIndex*>(&index);
-  const std::array<LogField, 15> fields{{
+  const std::array<LogField, 19> fields{{
       {"dimension", static_cast<std::uint64_t>(index.dimension())},
       {"kernel", std::string_view(fast_vector::dot_product_kernel_name(config.kernel))},
       {"read_only", config.read_only},
@@ -260,6 +298,11 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
       {"search_workers", static_cast<std::uint64_t>(config.search.workers)},
       {"search_queue_capacity", static_cast<std::uint64_t>(config.search.queue_capacity)},
       {"search_check_interval", static_cast<std::uint64_t>(config.search.check_interval)},
+      {"snapshot_publication_enabled", config.publication.enabled},
+      {"max_snapshot_bytes", config.publication.maximum_file_bytes},
+      {"generation", config.generation},
+      {"snapshot_id",
+       config.manifest ? std::string_view(config.manifest->snapshot_id()) : std::string_view{}},
       {"m", static_cast<std::uint64_t>(hnsw ? hnsw->config().max_connections : 0)},
       {"ef_construction", static_cast<std::uint64_t>(hnsw ? hnsw->config().ef_construction : 0)},
       {"ef_search", static_cast<std::uint64_t>(hnsw ? hnsw->config().ef_search : 0)},
@@ -274,7 +317,7 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
                 .status = "OK",
                 .index_type = config.index_type,
                 .vector_count = index.size()},
-               std::span<const LogField>(fields).first(hnsw ? 15 : 10));
+               std::span<const LogField>(fields).first(hnsw ? 19 : 14));
 }
 
 }  // namespace
@@ -293,10 +336,14 @@ int main(const int argc, char* argv[]) {
     phase = "index_initialization_failed";
     auto index = make_index(config, *logger);
     log_config(config, *index, *logger);
+    fast_vector::SnapshotIdentity identity;
+    if (!config.snapshot_manifest_path.empty()) {
+      identity = fast_vector::service::snapshot_identity(*config.manifest, config.generation);
+    }
     auto store = std::make_shared<fast_vector::VectorStore>(
-        std::move(index), config.maximum_batch_size, config.read_only);
+        std::move(index), config.maximum_batch_size, config.read_only, std::move(identity));
     fast_vector::service::VectorSearchService vector_service(store, config.index_type, logger,
-                                                             config.search);
+                                                             config.search, config.publication);
     if (stop_requested.load(std::memory_order_relaxed) != 0) {
       logger->write({.event = "shutdown_completed",
                      .status = "OK",

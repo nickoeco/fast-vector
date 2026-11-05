@@ -27,6 +27,7 @@ message BatchAddResponse {
 message SearchRequest {
   repeated float query = 1;
   uint32 k = 2;
+  string expected_snapshot_id = 3;
 }
 
 message Neighbor {
@@ -39,6 +40,52 @@ message SearchResponse {
   uint64 snapshot_version = 2;
   uint64 queue_us = 3;
   uint64 execution_us = 4;
+  string snapshot_id = 5;
+  uint64 generation = 6;
+  string embedding_revision = 7;
+}
+
+message SnapshotManifest {
+  uint32 format_version = 1;
+  string snapshot_id = 2;
+  string index_type = 3;
+  uint64 dimension = 4;
+  uint64 vector_count = 5;
+  uint64 file_size = 6;
+  string sha256 = 7;
+  string embedding_revision = 8;
+}
+
+message SnapshotIdentity {
+  string snapshot_id = 1;
+  uint64 generation = 2;
+  string embedding_revision = 3;
+}
+
+message PublicationStatus {
+  string state = 1;
+  SnapshotIdentity current = 2;
+  SnapshotIdentity candidate = 3;
+  uint64 highest_generation = 4;
+  string last_result = 5;
+  SnapshotIdentity last_attempt = 6;
+  uint64 prepare_us = 7;
+  uint64 activation_us = 8;
+  uint64 peak_rss_kib = 9;
+  bool enabled = 10;
+}
+
+message PrepareSnapshotRequest {
+  // The first frame contains manifest/generation only; later frames contain data only.
+  SnapshotManifest manifest = 1;
+  uint64 generation = 2;
+  bytes data = 3;
+  bool abort = 4;
+}
+
+message ActivateSnapshotRequest {
+  string snapshot_id = 1;
+  uint64 generation = 2;
 }
 
 message SearchExecutorStats {
@@ -72,6 +119,7 @@ message GetStatsResponse {
   bool read_only = 7;
   SearchExecutorStats search_executor = 8;
   uint64 snapshot_version = 9;
+  PublicationStatus publication = 10;
 }
 
 service VectorSearchService {
@@ -79,4 +127,6 @@ service VectorSearchService {
   rpc BatchAdd(BatchAddRequest) returns (BatchAddResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc PrepareSnapshot(stream PrepareSnapshotRequest) returns (PublicationStatus);
+  rpc ActivateSnapshot(ActivateSnapshotRequest) returns (PublicationStatus);
 }

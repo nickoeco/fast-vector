@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <fstream>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -20,7 +21,8 @@ constexpr std::array<std::string_view, 17> kStatusNames{
 
 VectorSearchService::VectorSearchService(std::shared_ptr<VectorStore> store, std::string index_type,
                                          std::shared_ptr<StructuredLogger> logger,
-                                         SearchExecutorConfig search_config)
+                                         SearchExecutorConfig search_config,
+                                         PublicationConfig publication_config)
     : store_(std::move(store)), index_type_(std::move(index_type)), logger_(std::move(logger)) {
   if (store_ == nullptr) {
     throw std::invalid_argument("gRPC vector service requires a vector store");
@@ -29,6 +31,8 @@ VectorSearchService::VectorSearchService(std::shared_ptr<VectorStore> store, std
     throw std::invalid_argument("gRPC vector service requires an index type");
   }
   executor_ = std::make_unique<SearchExecutor>(store_, search_config);
+  publication_ =
+      std::make_unique<SnapshotPublication>(store_, index_type_, std::move(publication_config));
 }
 
 VectorSearchService::RpcCall VectorSearchService::begin_rpc(
@@ -168,11 +172,13 @@ grpc::Status VectorSearchService::Search(grpc::ServerContext* context,
   try {
     const auto query = std::span<const float>(request->query().data(), request->query().size());
     if (request->k() != 0) {
-      if (query.size() != store_->dimension()) {
+      if (request->expected_snapshot_id().empty() && query.size() != store_->dimension()) {
         throw std::invalid_argument("query dimension does not match index dimension");
       }
       (void)normalize_l2(query);
     }
+    if (request->expected_snapshot_id().size() > 256)
+      throw std::invalid_argument("expected snapshot ID too long");
     auto deadline = SearchContext::Clock::time_point::max();
     if (context->deadline() != std::chrono::system_clock::time_point::max()) {
       const auto remaining = context->deadline() - std::chrono::system_clock::now();
@@ -182,8 +188,8 @@ grpc::Status VectorSearchService::Search(grpc::ServerContext* context,
       }
       if (remaining < deadline - now) deadline = now + remaining;
     }
-    auto ticket =
-        executor_->submit(std::vector<float>(query.begin(), query.end()), request->k(), deadline);
+    auto ticket = executor_->submit(std::vector<float>(query.begin(), query.end()), request->k(),
+                                    deadline, request->expected_snapshot_id());
     while (ticket.future.wait_for(std::chrono::milliseconds(2)) != std::future_status::ready) {
       if (context->IsCancelled()) {
         executor_->cancel(ticket.cancellation,
@@ -205,11 +211,114 @@ grpc::Status VectorSearchService::Search(grpc::ServerContext* context,
     response->set_snapshot_version(outcome.result.snapshot_version);
     response->set_queue_us(outcome.queue_us);
     response->set_execution_us(outcome.execution_us);
+    response->set_snapshot_id(outcome.result.identity.snapshot_id);
+    response->set_generation(outcome.result.identity.generation);
+    response->set_embedding_revision(outcome.result.identity.embedding_revision);
     return finish_rpc(call, grpc::Status::OK);
   } catch (const std::exception& error) {
     return finish_rpc(call, exception_status(error));
   } catch (...) {
     return finish_rpc(call, {grpc::StatusCode::INTERNAL, "internal vector service error"});
+  }
+}
+
+grpc::Status VectorSearchService::PrepareSnapshot(
+    grpc::ServerContext* context, grpc::ServerReader<v1::PrepareSnapshotRequest>* reader,
+    v1::PublicationStatus* response) {
+  const auto call = begin_rpc("PrepareSnapshot");
+  std::uint64_t token = 0;
+  v1::PrepareSnapshotRequest frame;
+  v1::SnapshotManifest manifest;
+  std::uint64_t generation = 0;
+  try {
+    if (!publication_->config().enabled) throw PublicationDisabledError();
+    if (!reader->Read(&frame) || !frame.has_manifest() || !frame.data().empty() || frame.abort()) {
+      throw std::invalid_argument("first frame requires manifest and generation only");
+    }
+    manifest = frame.manifest();
+    generation = frame.generation();
+    token = publication_->begin(manifest, generation);
+    if (logger_)
+      logger_->write(
+          {.event = "snapshot_prepare_started", .index_type = index_type_},
+          {{"generation", generation}, {"snapshot_id", std::string_view(manifest.snapshot_id())}});
+    SnapshotStagingFile staging(publication_->config().staging_directory);
+    std::ofstream output(staging.path(), std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("snapshot staging unavailable");
+    std::uint64_t received = 0;
+    while (reader->Read(&frame)) {
+      if (context->IsCancelled()) {
+        publication_->fail(token);
+        return finish_rpc(call, cancelled_status(*context));
+      }
+      if (frame.abort() || frame.has_manifest() || frame.generation() != 0 ||
+          frame.data().empty() || frame.data().size() > 256 * 1024 ||
+          frame.data().size() > manifest.file_size() - received) {
+        throw std::invalid_argument("invalid snapshot data frame or length");
+      }
+      output.write(frame.data().data(), static_cast<std::streamsize>(frame.data().size()));
+      if (!output) throw std::runtime_error("snapshot staging write failed");
+      received += frame.data().size();
+    }
+    if (context->IsCancelled()) {
+      publication_->fail(token);
+      return finish_rpc(call, cancelled_status(*context));
+    }
+    output.flush();
+    if (!output || received != manifest.file_size())
+      throw std::invalid_argument("snapshot length mismatch");
+    output.close();
+    if (!output) throw std::runtime_error("snapshot staging close failed");
+    publication_->complete(staging.path(), token);
+    *response = publication_->status();
+    if (logger_)
+      logger_->write({.event = "snapshot_ready", .status = "OK", .index_type = index_type_},
+                     {{"generation", generation}, {"prepare_us", response->prepare_us()}});
+    return finish_rpc(call, grpc::Status::OK);
+  } catch (const std::exception& error) {
+    if (token)
+      publication_->fail(token);
+    else if (publication_->config().enabled) {
+      try {
+        publication_->rejected(manifest, generation);
+      } catch (...) {
+      }
+    }
+    if (logger_ && token)
+      logger_->write(
+          {.severity = "ERROR", .event = "snapshot_prepare_failed", .index_type = index_type_},
+          {{"generation", generation}});
+    if (dynamic_cast<const std::bad_alloc*>(&error)) {
+      return finish_rpc(call,
+                        {grpc::StatusCode::RESOURCE_EXHAUSTED, "snapshot resources unavailable"});
+    }
+    if (dynamic_cast<const PublicationBusyError*>(&error) ||
+        dynamic_cast<const SnapshotMismatchError*>(&error) ||
+        dynamic_cast<const ReadOnlyStoreError*>(&error) ||
+        dynamic_cast<const PublicationDisabledError*>(&error))
+      return finish_rpc(call, exception_status(error));
+    return finish_rpc(
+        call, {token ? grpc::StatusCode::FAILED_PRECONDITION : grpc::StatusCode::INVALID_ARGUMENT,
+               "snapshot preparation failed"});
+  }
+}
+
+grpc::Status VectorSearchService::ActivateSnapshot(grpc::ServerContext* context,
+                                                   const v1::ActivateSnapshotRequest* request,
+                                                   v1::PublicationStatus* response) {
+  const auto call = begin_rpc("ActivateSnapshot");
+  if (context->IsCancelled()) return finish_rpc(call, cancelled_status(*context));
+  try {
+    if (request->snapshot_id().size() > 256) throw std::invalid_argument("snapshot ID too long");
+    publication_->activate(request->snapshot_id(), request->generation());
+    *response = publication_->status();
+    if (logger_)
+      logger_->write(
+          {.event = "snapshot_activated", .status = "OK", .index_type = index_type_},
+          {{"generation", request->generation()}, {"activation_us", response->activation_us()}});
+    return finish_rpc(call, grpc::Status::OK);
+  } catch (const std::exception& error) {
+    return finish_rpc(call, exception_status(error));
   }
 }
 
@@ -220,7 +329,8 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     return finish_rpc(call, cancelled_status(*context));
   }
   try {
-    const StoreStats stats = store_->stats();
+    StoreStats stats{};
+    auto publication = publication_->status(&stats);
     response->set_index_type(index_type_);
     response->set_vector_count(stats.index_size);
     response->set_dimension(stats.dimension);
@@ -229,6 +339,7 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     response->set_inserted_vectors(stats.inserted_vectors);
     response->set_read_only(stats.read_only);
     response->set_snapshot_version(stats.snapshot_version);
+    *response->mutable_publication() = std::move(publication);
     const auto scheduler = executor_->stats();
     auto* scheduling = response->mutable_search_executor();
     scheduling->set_workers(scheduler.workers);
@@ -261,6 +372,15 @@ grpc::Status VectorSearchService::cancelled_status(const grpc::ServerContext& co
 }
 
 grpc::Status VectorSearchService::exception_status(const std::exception& error) {
+  if (dynamic_cast<const PublicationDisabledError*>(&error)) {
+    return {grpc::StatusCode::FAILED_PRECONDITION, "snapshot publication is disabled"};
+  }
+  if (dynamic_cast<const SnapshotMismatchError*>(&error)) {
+    return {grpc::StatusCode::FAILED_PRECONDITION, "snapshot identity or generation mismatch"};
+  }
+  if (dynamic_cast<const PublicationBusyError*>(&error)) {
+    return {grpc::StatusCode::RESOURCE_EXHAUSTED, "snapshot preparation already in progress"};
+  }
   if (const auto* rejected = dynamic_cast<const SearchRejected*>(&error)) {
     return {
         rejected->stopping() ? grpc::StatusCode::UNAVAILABLE : grpc::StatusCode::RESOURCE_EXHAUSTED,
