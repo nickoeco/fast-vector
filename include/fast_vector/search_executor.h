@@ -61,7 +61,8 @@ class SearchExecutor {
 
   [[nodiscard]] SearchTicket submit(
       std::vector<float> query, std::size_t k,
-      SearchContext::Clock::time_point deadline = SearchContext::Clock::time_point::max());
+      SearchContext::Clock::time_point deadline = SearchContext::Clock::time_point::max(),
+      std::string expected_snapshot_id = {});
   /** Remove a waiting task immediately, or signal an active task's shared state. */
   void cancel(const std::shared_ptr<SearchCancellation>& cancellation, SearchStopReason reason);
   /** Stop admission and notify/cancel tasks without joining; safe before gRPC shutdown. */

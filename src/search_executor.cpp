@@ -32,11 +32,13 @@ SearchExecutor::SearchExecutor(std::shared_ptr<VectorStore> store, SearchExecuto
 SearchExecutor::~SearchExecutor() { shutdown(); }
 
 SearchTicket SearchExecutor::submit(std::vector<float> query, std::size_t k,
-                                    SearchContext::Clock::time_point deadline) {
+                                    SearchContext::Clock::time_point deadline,
+                                    std::string expected_snapshot_id) {
   auto task = std::make_unique<SearchTask>();
   task->query = std::move(query);
   task->k = k;
   task->context = {deadline, std::make_shared<SearchCancellation>(), config_.check_interval};
+  task->context.expected_snapshot_id = std::move(expected_snapshot_id);
   auto future = task->promise.get_future();
   auto cancellation = task->context.cancellation;
   {

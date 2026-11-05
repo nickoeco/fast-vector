@@ -10,7 +10,7 @@
 namespace fast_vector {
 
 VectorStore::VectorStore(std::unique_ptr<VectorIndex> index, const std::size_t maximum_batch_size,
-                         const bool read_only)
+                         const bool read_only, SnapshotIdentity identity)
     : writable_index_(std::move(index)),
       maximum_batch_size_(maximum_batch_size),
       read_only_(read_only) {
@@ -20,8 +20,17 @@ VectorStore::VectorStore(std::unique_ptr<VectorIndex> index, const std::size_t m
   if (maximum_batch_size_ == 0) {
     throw std::invalid_argument("maximum batch size must be greater than zero");
   }
+  if ((identity.snapshot_id.empty() != (identity.generation == 0)) ||
+      (identity.snapshot_id.empty() && !identity.embedding_revision.empty()) ||
+      identity.snapshot_id.size() > 256 || identity.embedding_revision.size() > 256) {
+    throw std::invalid_argument("invalid initial snapshot identity");
+  }
   if (read_only_) {
-    publish_snapshot(std::shared_ptr<const VectorIndex>(std::move(writable_index_)));
+    publish_snapshot(std::shared_ptr<const VectorIndex>(std::move(writable_index_)),
+                     std::move(identity));
+  } else if (!identity.snapshot_id.empty() || identity.generation != 0 ||
+             !identity.embedding_revision.empty()) {
+    throw std::invalid_argument("snapshot identity requires read-only mode");
   }
 }
 
@@ -58,7 +67,7 @@ void VectorStore::replace_index(std::unique_ptr<VectorIndex> index) {
   publish_snapshot(std::move(replacement));
 }
 
-std::shared_ptr<const VectorStore::IndexSnapshot> VectorStore::acquire_snapshot() const {
+std::shared_ptr<const ServingSnapshot> VectorStore::acquire_snapshot() const {
 #if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
   return snapshot_.load(std::memory_order_acquire);
 #else
@@ -66,20 +75,61 @@ std::shared_ptr<const VectorStore::IndexSnapshot> VectorStore::acquire_snapshot(
 #endif
 }
 
-void VectorStore::publish_snapshot(std::shared_ptr<const VectorIndex> snapshot) {
+void VectorStore::publish_snapshot(std::shared_ptr<const VectorIndex> snapshot,
+                                   SnapshotIdentity identity) {
   // Publish version and index in one immutable object, never as separate atomics.
   std::lock_guard lock(publication_mutex_);
   const auto previous = acquire_snapshot();
+  if (previous && previous->identity.generation != 0) throw SnapshotMismatchError();
   const auto version = previous ? previous->version : 0;
   if (version == std::numeric_limits<std::uint64_t>::max()) {
     throw std::length_error("snapshot version exhausted");
   }
-  std::shared_ptr<const IndexSnapshot> publication =
-      std::make_shared<IndexSnapshot>(IndexSnapshot{std::move(snapshot), version + 1});
+  std::shared_ptr<const ServingSnapshot> publication = std::make_shared<ServingSnapshot>(
+      ServingSnapshot{std::move(snapshot), version + 1, std::move(identity)});
 #if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
   snapshot_.store(std::move(publication), std::memory_order_release);
 #else
   std::atomic_store_explicit(&snapshot_, std::move(publication), std::memory_order_release);
+#endif
+}
+
+std::shared_ptr<const ServingSnapshot> VectorStore::serving_snapshot() const {
+  if (!read_only_) throw ReadOnlyStoreError();
+  return acquire_snapshot();
+}
+
+std::shared_ptr<const ServingSnapshot> VectorStore::prepare_snapshot(
+    std::unique_ptr<VectorIndex> index, SnapshotIdentity identity) {
+  if (!read_only_) throw ReadOnlyStoreError();
+  if (!index || identity.snapshot_id.empty() || identity.generation == 0 ||
+      identity.snapshot_id.size() > 256 || identity.embedding_revision.size() > 256) {
+    throw std::invalid_argument("invalid serving snapshot identity");
+  }
+  const auto current = acquire_snapshot();
+  if (identity.generation <= current->identity.generation) throw SnapshotMismatchError();
+  if (current->version == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::length_error("snapshot version exhausted");
+  }
+  return std::make_shared<ServingSnapshot>(
+      ServingSnapshot{std::shared_ptr<const VectorIndex>(std::move(index)), current->version + 1,
+                      std::move(identity)});
+}
+
+void VectorStore::activate_snapshot(std::shared_ptr<const ServingSnapshot> snapshot) {
+  if (!read_only_) throw ReadOnlyStoreError();
+  if (!snapshot || !snapshot->index || snapshot->identity.snapshot_id.empty() ||
+      snapshot->identity.generation == 0)
+    throw std::invalid_argument("invalid serving snapshot");
+  std::lock_guard lock(publication_mutex_);
+  const auto current = acquire_snapshot();
+  if (snapshot->identity.generation <= current->identity.generation ||
+      snapshot->version != current->version + 1)
+    throw SnapshotMismatchError();
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+  snapshot_.store(std::move(snapshot), std::memory_order_release);
+#else
+  std::atomic_store_explicit(&snapshot_, std::move(snapshot), std::memory_order_release);
 #endif
 }
 
@@ -95,11 +145,17 @@ SnapshotSearchResult VectorStore::search(const std::span<const float> query, con
     context.check();
     std::vector<SearchResult> results;
     std::uint64_t version = 0;
+    SnapshotIdentity identity;
     if (read_only_) {
       const auto snapshot = acquire_snapshot();
       version = snapshot->version;
+      if (!context.expected_snapshot_id.empty() &&
+          context.expected_snapshot_id != snapshot->identity.snapshot_id)
+        throw SnapshotMismatchError();
+      identity = snapshot->identity;
       results = snapshot->index->search(query, k, context);
     } else {
+      if (!context.expected_snapshot_id.empty()) throw SnapshotMismatchError();
       std::shared_lock lock(mutex_, std::defer_lock);
       if (context.enabled()) {
         while (!lock.try_lock_for(std::chrono::milliseconds(2))) context.check();
@@ -111,7 +167,7 @@ SnapshotSearchResult VectorStore::search(const std::span<const float> query, con
     }
     context.check();
     successful_queries_.fetch_add(1, std::memory_order_relaxed);
-    return {std::move(results), version};
+    return {std::move(results), version, std::move(identity)};
   } catch (...) {
     failed_queries_.fetch_add(1, std::memory_order_relaxed);
     throw;
@@ -119,7 +175,8 @@ SnapshotSearchResult VectorStore::search(const std::span<const float> query, con
 }
 
 StoreStats VectorStore::stats() const {
-  const auto observe = [this](const VectorIndex& index, const std::uint64_t version) {
+  const auto observe = [this](const VectorIndex& index, const std::uint64_t version,
+                              const SnapshotIdentity& identity = {}) {
     return StoreStats{
         index.size(),
         index.dimension(),
@@ -128,11 +185,12 @@ StoreStats VectorStore::stats() const {
         inserted_vectors_.load(std::memory_order_relaxed),
         read_only_,
         version,
+        identity,
     };
   };
   if (read_only_) {
     const auto snapshot = acquire_snapshot();
-    return observe(*snapshot->index, snapshot->version);
+    return observe(*snapshot->index, snapshot->version, snapshot->identity);
   }
   std::shared_lock lock(mutex_);
   return observe(*writable_index_, 0);

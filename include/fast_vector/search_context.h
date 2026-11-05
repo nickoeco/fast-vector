@@ -6,6 +6,7 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace fast_vector {
 
@@ -42,6 +43,7 @@ struct SearchContext {
   Clock::time_point deadline = Clock::time_point::max();
   std::shared_ptr<SearchCancellation> cancellation;
   std::size_t check_interval = 64;
+  std::string expected_snapshot_id{};
 
   [[nodiscard]] bool enabled() const noexcept {
     return cancellation || deadline != Clock::time_point::max();

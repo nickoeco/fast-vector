@@ -9,11 +9,31 @@
 #include <shared_mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "fast_vector/vector_index.h"
 
 namespace fast_vector {
+
+struct SnapshotIdentity {
+  std::string snapshot_id{};
+  std::uint64_t generation = 0;
+  std::string embedding_revision{};
+  bool operator==(const SnapshotIdentity&) const = default;
+};
+
+/** The complete immutable unit acquired by a read-only query. */
+struct ServingSnapshot {
+  std::shared_ptr<const VectorIndex> index;
+  std::uint64_t version;
+  SnapshotIdentity identity;
+};
+
+class SnapshotMismatchError : public std::logic_error {
+ public:
+  SnapshotMismatchError() : std::logic_error("snapshot identity or generation mismatch") {}
+};
 
 /** An owning vector payload used by batch insertion APIs. */
 struct VectorRecord {
@@ -30,12 +50,14 @@ struct StoreStats {
   std::uint64_t inserted_vectors;
   bool read_only;
   std::uint64_t snapshot_version;
+  SnapshotIdentity identity{};
 };
 
 struct SnapshotSearchResult {
   std::vector<SearchResult> neighbors;
   // Process-local publication sequence; zero identifies the mutable ownership path.
   std::uint64_t snapshot_version;
+  SnapshotIdentity identity{};
 };
 
 /** Raised when a mutating operation targets a read-only store. */
@@ -48,7 +70,7 @@ class ReadOnlyStoreError : public std::logic_error {
 class VectorStore {
  public:
   explicit VectorStore(std::unique_ptr<VectorIndex> index, std::size_t maximum_batch_size = 1'000,
-                       bool read_only = false);
+                       bool read_only = false, SnapshotIdentity identity = {});
 
   void add(VectorId id, std::span<const float> vector);
 
@@ -62,6 +84,11 @@ class VectorStore {
    * Each query retains its snapshot until search completes. Requires a read-only store.
    */
   void replace_index(std::unique_ptr<VectorIndex> index);
+  /** Allocate publication metadata during preparation, leaving activation as a pointer swap. */
+  [[nodiscard]] std::shared_ptr<const ServingSnapshot> prepare_snapshot(
+      std::unique_ptr<VectorIndex> index, SnapshotIdentity identity);
+  void activate_snapshot(std::shared_ptr<const ServingSnapshot> snapshot);
+  [[nodiscard]] std::shared_ptr<const ServingSnapshot> serving_snapshot() const;
 
   [[nodiscard]] std::vector<SearchResult> search(std::span<const float> query, std::size_t k) const;
   [[nodiscard]] SnapshotSearchResult search(std::span<const float> query, std::size_t k,
@@ -77,20 +104,17 @@ class VectorStore {
 
  private:
   void validate_batch(std::span<const VectorRecord> vectors) const;
-  struct IndexSnapshot {
-    std::shared_ptr<const VectorIndex> index;
-    std::uint64_t version;
-  };
-  [[nodiscard]] std::shared_ptr<const IndexSnapshot> acquire_snapshot() const;
-  void publish_snapshot(std::shared_ptr<const VectorIndex> snapshot);
+  [[nodiscard]] std::shared_ptr<const ServingSnapshot> acquire_snapshot() const;
+  void publish_snapshot(std::shared_ptr<const VectorIndex> snapshot,
+                        SnapshotIdentity identity = {});
 
   // Exactly one ownership path is populated, determined by the immutable read_only_ flag.
   std::unique_ptr<VectorIndex> writable_index_;
 #if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
-  std::atomic<std::shared_ptr<const IndexSnapshot>> snapshot_{nullptr};
+  std::atomic<std::shared_ptr<const ServingSnapshot>> snapshot_{nullptr};
 #else
   // libstdc++ 11 lacks the C++20 specialization; access only through shared_ptr atomic APIs.
-  std::shared_ptr<const IndexSnapshot> snapshot_;
+  std::shared_ptr<const ServingSnapshot> snapshot_;
 #endif
   std::size_t maximum_batch_size_;
   const bool read_only_;

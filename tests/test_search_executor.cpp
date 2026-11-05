@@ -280,6 +280,33 @@ TEST(SearchContextTest, BatchChecksAndCancellationReasonsAreDeterministic) {
   EXPECT_THROW(context.validate(), std::invalid_argument);
 }
 
+TEST(SearchExecutorTest, ExpectedIdentityIsCheckedAfterDequeueAndReload) {
+  auto gate = std::make_shared<Gate>();
+  auto store = std::make_shared<VectorStore>(std::make_unique<ControlledIndex>(gate), 10, true,
+                                             SnapshotIdentity{"snapshot-a", 1, "rev-a"});
+  SearchExecutor executor(store, {1, 1, 1});
+  ReleaseOnExit release{gate};
+  auto active = executor.submit({1, 0}, 1);
+  ASSERT_TRUE(gate->wait_for_calls(1));
+  auto waiting = executor.submit({2, 0}, 1, SearchContext::Clock::time_point::max(), "snapshot-a");
+  auto replacement = std::make_unique<FlatIndex>(2);
+  replacement->add(20, std::vector<float>{1, 0});
+  store->activate_snapshot(
+      store->prepare_snapshot(std::move(replacement), {"snapshot-b", 2, "rev-b"}));
+  gate->release();
+  const auto original = active.future.get();
+  EXPECT_EQ(original.result.identity.snapshot_id, "snapshot-a");
+  EXPECT_EQ(original.result.neighbors[0].id, 1U);
+  const auto mismatch = waiting.future.get();
+  ASSERT_NE(mismatch.error, nullptr);
+  EXPECT_THROW(std::rethrow_exception(mismatch.error), SnapshotMismatchError);
+  auto current = executor.submit({2, 0}, 1, SearchContext::Clock::time_point::max(), "snapshot-b");
+  const auto matched = current.future.get();
+  EXPECT_EQ(matched.result.neighbors[0].id, 20U);
+  EXPECT_EQ(matched.result.identity.generation, 2U);
+  EXPECT_EQ(matched.result.identity.embedding_revision, "rev-b");
+}
+
 TEST(SearchContextTest, BuiltinIndexesRejectExpiredAndCancelledSearchesWithoutMutation) {
   FlatIndex flat(2);
   HnswIndex hnsw({.dimension = 2, .max_connections = 2, .ef_construction = 8});
