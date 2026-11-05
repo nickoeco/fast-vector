@@ -51,7 +51,10 @@ Waiting tasks retain the store, not an old snapshot. An immutable publication ho
 and version. Read-only process-local versions start at 1 and increment only on successful
 publication; mutable stores return 0. `SearchResponse.snapshot_version` identifies the actual
 snapshot searched. `GetStats` observes its own current version. These are not file-format versions,
-content hashes, durable identities or multi-process dataset versions; Phase 11B can build on them.
+content hashes, durable identities or multi-process dataset versions. Managed releases now add
+content snapshot IDs, deployment generations and embedding labels in the same immutable object.
+The optional expected-ID guard belongs to the queued context and is checked against the acquired
+publication. See [replica publication](snapshot_publication.md) for the 11B protocol.
 
 ## Shutdown
 

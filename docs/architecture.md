@@ -122,6 +122,20 @@ Search admission, cancels waiting/active tasks, drains gRPC and joins workers. I
 their direct path. An immutable publication bundles its index with a process-local version
 returned by Search. See [service concurrency](service_concurrency.md) for timing and limitations.
 
+## Read-only replica publication
+
+Managed read-only stores atomically own a `ServingSnapshot` containing index, local counter,
+content snapshot ID, release generation and embedding revision. A dedicated manager admits
+one candidate, receives bounded gRPC chunks, checks SHA-256/length/format/shape, and uses the
+complete binary loader before marking READY. Activation publishes the preallocated object.
+Queries and their expected-ID guard use the actual snapshot acquired at execution.
+
+The explicit replica-list publisher rolls prepares/activations and re-observes every target.
+Rollback raises generation while reusing old content. Failed preparations preserve serving
+data and the process-local high-water fence. There is no cross-replica atomic commit, consensus
+or durable control journal. Restart uses an explicit current bootstrap configuration. See
+[snapshot publication](snapshot_publication.md) for framing, fencing and recovery semantics.
+
 ## Structured service logs
 
 The optional gRPC target owns a shared JSON Lines writer on stderr. Application handlers emit
@@ -156,8 +170,8 @@ replication or consistency.
 - No writable hot reload or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.
-- No multi-replica consistency for writable indexes; immutable read-only snapshots can be
-  mounted consistently only when the platform supplies the same file to every Pod.
+- No writable replication. Read-only rolling publication provides observed eventual convergence,
+  with no cross-replica atomicity or automatic restart recovery of the control fence.
 - Direct calls to the low-level snapshot save API do not provide atomic replacement; the
   offline builder provides the durable Linux publication workflow.
 - Resource limits are starting values, not production sizing recommendations.

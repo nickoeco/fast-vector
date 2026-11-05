@@ -45,6 +45,10 @@ can still block.
 | `index_load_failed` | Operation, elapsed time, sanitized reason, `kept_previous_index`; status `FAILED_PRECONDITION` |
 | `index_replaced` | Live replacement count and dimension after successful Flat or HNSW publication |
 | `index_replace_failed` | Publication failure after successful loading; previous snapshot retained |
+| `snapshot_prepare_started` | Accepted managed generation and validated content snapshot ID |
+| `snapshot_ready` | Generation and full preparation microseconds; serving data is unchanged |
+| `snapshot_prepare_failed` | Accepted generation failed; previous serving data retained |
+| `snapshot_activated` | Activated generation and pointer-publication microseconds |
 | `server_started` | Selected listening port after gRPC starts |
 | `rpc_completed` | Method, request ID, gRPC status, numeric `status_code`, handler latency |
 | `shutdown_requested` | Reason: `SIGINT`, `SIGTERM`, or `internal_stop` |
@@ -64,7 +68,8 @@ before logging. It excludes network transport, protobuf transport serialization,
 write itself. It is not client-observed latency. Snapshot latency includes file loading and
 validation, but excludes publication into the store and the completion log write.
 
-Only the four application handlers (`AddVector`, `BatchAdd`, `Search`, `GetStats`) contribute
+The application handlers (`AddVector`, `BatchAdd`, `Search`, `GetStats`, `PrepareSnapshot`,
+`ActivateSnapshot`) contribute
 to the counters. The health service and transport failures before handler invocation do not.
 The status is the handler's return value; the client may observe another outcome after a
 network failure or deadline. Totals cover the process lifetime and are emitted once after
@@ -76,6 +81,8 @@ reliable shutdown summary. These counters are separate from `VectorStore` statis
 Call sites use an explicit metadata allowlist. Logs exclude vector values, query text,
 document chunks, external vector IDs, client metadata/authorization, peer addresses, snapshot
 paths, and raw exception messages. Errors use fixed status names and sanitized reason codes.
+Managed publication events contain numeric generations and validated SHA-256 content IDs;
+file chunks and raw rejected identity strings are never written to logs.
 Do not add arbitrary request fields or `exception.what()` to future records.
 
 One shared writer serializes complete records with a mutex and flushes each write. Control

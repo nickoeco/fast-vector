@@ -24,6 +24,7 @@ a from-scratch approximate HNSW index using cosine similarity.
 - In-memory single-threaded HNSW construction and approximate cosine search
 - Thread-safe `VectorStore` application layer with serialized insertion and concurrent search
 - Optional synchronous gRPC server with protobuf code generation and standard health checks
+- Opt-in read-only multi-replica publication with SHA-256 manifests, generation fencing and rollback
 
 Service deletion, authentication, TLS, and metadata storage are not implemented yet.
 Persistence currently means complete FlatIndex and HnswIndex snapshots; incremental
@@ -39,8 +40,8 @@ deadlines, bounded request messages, and the standard gRPC health protocol.
 - Network access during the first test configuration: CMake FetchContent downloads
   GoogleTest 1.15.2. The library and demo have no runtime third-party dependencies.
 - Optional gRPC build: protobuf compiler and development files, the gRPC C++ development
-  package, and `grpc_cpp_plugin`. On Ubuntu 22.04/WSL2 these are available through
-  `protobuf-compiler`, `protobuf-compiler-grpc`, `libprotobuf-dev`, and `libgrpc++-dev`.
+  package, `grpc_cpp_plugin`, and OpenSSL Crypto. On Ubuntu 22.04/WSL2 these are available through
+  `protobuf-compiler`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `libgrpc++-dev`, and `libssl-dev`.
 
 ## Build and test
 
@@ -229,7 +230,7 @@ Install the optional build dependencies on Ubuntu 22.04/WSL2, then configure exp
 
 ```bash
 sudo apt update
-sudo apt install protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev
+sudo apt install protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev libssl-dev
 
 cmake -S . -B build-grpc \
   -DCMAKE_BUILD_TYPE=Release \
@@ -337,6 +338,16 @@ The server writes structured JSON Lines to stderr for startup configuration, sna
 RPC outcomes, shutdown reasons, and per-status error totals. It logs only allowlisted metadata;
 vectors, document text, request metadata, snapshot paths, and raw exception messages are excluded.
 See [structured logging](docs/logging.md) for fields, timing boundaries, collection, and limitations.
+
+Read-only multi-replica releases can opt into `--snapshot-manifest PATH --generation G
+--enable-snapshot-publication true` alongside the read-only/load options. The publisher streams
+local or HTTP(S) artifacts to explicitly listed replicas, prepares one candidate per replica,
+activates atomically, then reports observed convergence. Responses carry the actual content
+snapshot ID, deployment generation and optional embedding revision; `--expected-snapshot-id`
+on the query client detects mismatches. Rollback uses old bytes with a newer generation.
+This managed mode disables SIGHUP. Its fence is process-local: restart needs the current
+artifact/manifest/generation in deployment configuration. See [snapshot publication](docs/snapshot_publication.md)
+for the protocol, commands, consistency boundary and measured three-process acceptance tests.
 
 The server enables gRPC's standard health-check service. Transport security, authentication,
 persistence during service operation, writable hot reload, reflection, and production observability
