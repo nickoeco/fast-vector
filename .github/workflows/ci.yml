@@ -108,6 +108,7 @@ jobs:
           python -m unittest -v tests/grpc_python_test.py
           python -m unittest -v tests/semantic_search_test.py
           python -m unittest -v tests/snapshot_publication_test.py
+          python -m unittest -v tests/wal_recovery_test.py
       - name: Upload snapshot publication reports
         if: always()
         uses: actions/upload-artifact@v4
