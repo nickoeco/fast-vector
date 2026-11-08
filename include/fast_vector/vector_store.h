@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "fast_vector/durable_flat_index.h"
 #include "fast_vector/vector_index.h"
 
 namespace fast_vector {
@@ -51,6 +52,7 @@ struct StoreStats {
   bool read_only;
   std::uint64_t snapshot_version;
   SnapshotIdentity identity{};
+  DurabilityStats durability{};
 };
 
 struct SnapshotSearchResult {
@@ -73,6 +75,11 @@ class VectorStore {
                        bool read_only = false, SnapshotIdentity identity = {});
 
   void add(VectorId id, std::span<const float> vector);
+  /** Durable mode requires a stable client operation ID; volatile mode rejects one. */
+  [[nodiscard]] CommitResult add(VectorId id, std::span<const float> vector,
+                                 const std::string& operation_id);
+  [[nodiscard]] std::uint64_t checkpoint();
+  [[nodiscard]] DurabilityStats durability_stats() const;
 
   /**
    * Add a prevalidated batch while holding one exclusive lock.

@@ -20,6 +20,7 @@ add_library(fast_vector
     src/batch_searcher.cpp
     src/distance.cpp
     src/distance_auto.cpp
+    src/durable_flat_index.cpp
     src/flat_index.cpp
     src/flat_index_io.cpp
     src/hnsw_index.cpp
@@ -132,6 +133,9 @@ if(FAST_VECTOR_BUILD_TESTS)
 
     include(GoogleTest)
     gtest_discover_tests(fast_vector_tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_sources(fast_vector_tests PRIVATE tests/test_durable_flat_index.cpp)
+    endif()
     add_executable(fast_vector_hnsw_failure_tests tests/test_hnsw_allocation_failure.cpp)
     target_link_libraries(fast_vector_hnsw_failure_tests PRIVATE fast_vector::fast_vector GTest::gtest_main)
     fast_vector_set_warnings(fast_vector_hnsw_failure_tests)

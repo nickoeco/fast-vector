@@ -11,6 +11,7 @@
 namespace fast_vector {
 
 class FlatIndexSerializer;
+class WalIndexAccess;
 
 /** Exact cosine-similarity index backed by row-major contiguous storage. */
 class FlatIndex final : public VectorIndex {
@@ -33,6 +34,8 @@ class FlatIndex final : public VectorIndex {
 
  private:
   friend class FlatIndexSerializer;
+  friend class WalIndexAccess;
+  void add_normalized(VectorId id, std::span<const float> normalized);
 
   std::size_t dimension_;
   DotProductKernel kernel_;

@@ -9,6 +9,7 @@
 #include <new>
 #include <vector>
 
+#include "fast_vector/durable_flat_index.h"
 #include "fast_vector/flat_index.h"
 #include "fast_vector/hnsw_index_io.h"
 #include "fast_vector/vector_store.h"
@@ -212,5 +213,58 @@ TEST(HnswAllocationFailureTest, RebuildFailureLeavesSourceUnchanged) {
   EXPECT_EQ(snapshot.bytes(source.rebuild(123)), expected);
   std::cout << "Verified rebuild allocation failure points: " << failures << '\n';
 }
+
+#if defined(__linux__)
+TEST(WalAllocationFailureTest, EveryPostSyncAllocationFailureRequiresRecovery) {
+  std::size_t failures = 0;
+  bool completed = false;
+  for (std::ptrdiff_t point = 0; point < 32; ++point) {
+    auto directory =
+        std::filesystem::temp_directory_path() /
+        ("fast-vector-wal-allocation-" +
+         std::to_string(reinterpret_cast<std::uintptr_t>(&failures)) + "-" + std::to_string(point));
+    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    fast_vector::WalOptions options{.directory = directory, .dimension = 3, .fault_hook = {}};
+    const std::vector<float> values{1, 2, 3};
+    bool rejected = false;
+    {
+      auto injected = options;
+      injected.fault_hook = [point](fast_vector::WalBoundary boundary) {
+        if (boundary == fast_vector::WalBoundary::BeforeApply) allocations_left = point;
+        if (boundary == fast_vector::WalBoundary::AfterApply) allocations_left = -1;
+      };
+      fast_vector::DurableFlatIndex index(injected);
+      try {
+        (void)index.commit("operation", 42, values);
+      } catch (const std::bad_alloc&) {
+        rejected = true;
+      }
+      allocations_left = -1;
+      if (rejected) {
+        EXPECT_TRUE(index.durability_stats().recovery_required);
+        EXPECT_EQ(index.size(), 0);
+        EXPECT_THROW((void)index.commit("next", 43, values), fast_vector::RecoveryRequiredError);
+      } else {
+        EXPECT_EQ(index.size(), 1);
+      }
+    }
+    {
+      fast_vector::DurableFlatIndex recovered(options);
+      EXPECT_EQ(recovered.size(), 1);
+      EXPECT_TRUE(recovered.commit("operation", 42, values).replayed);
+      EXPECT_EQ(recovered.search(values, 1).at(0).id, 42);
+    }
+    std::filesystem::remove_all(directory);
+    if (!rejected) {
+      completed = true;
+      break;
+    }
+    ++failures;
+  }
+  EXPECT_TRUE(completed);
+  EXPECT_GT(failures, 0);
+  std::cout << "Verified post-sync allocation failure points: " << failures << '\n';
+}
+#endif
 
 }  // namespace

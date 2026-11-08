@@ -43,12 +43,44 @@ void VectorStore::add(const VectorId id, const std::span<const float> vector) {
   inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
 }
 
+CommitResult VectorStore::add(const VectorId id, const std::span<const float> vector,
+                              const std::string& operation_id) {
+  if (read_only_) throw ReadOnlyStoreError();
+  std::unique_lock lock(mutex_);
+  if (auto* durable = dynamic_cast<DurableFlatIndex*>(writable_index_.get())) {
+    auto result = durable->commit(operation_id, id, vector);
+    if (!result.replayed) inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
+    return result;
+  }
+  if (!operation_id.empty()) throw std::invalid_argument("client operation IDs require WAL mode");
+  writable_index_->add(id, vector);
+  inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
+  return {0, writable_index_->size(), false};
+}
+
+std::uint64_t VectorStore::checkpoint() {
+  if (read_only_) throw ReadOnlyStoreError();
+  std::unique_lock lock(mutex_);
+  auto* durable = dynamic_cast<DurableFlatIndex*>(writable_index_.get());
+  if (!durable) throw DurabilityModeError("checkpoint requires WAL mode");
+  return durable->checkpoint();
+}
+
+DurabilityStats VectorStore::durability_stats() const {
+  if (read_only_) return {};
+  std::shared_lock lock(mutex_);
+  const auto* durable = dynamic_cast<const DurableFlatIndex*>(writable_index_.get());
+  return durable ? durable->durability_stats() : DurabilityStats{};
+}
+
 void VectorStore::add_batch(const std::span<const VectorRecord> vectors) {
   if (read_only_) {
     throw ReadOnlyStoreError();
   }
   validate_batch(vectors);
   std::unique_lock lock(mutex_);
+  if (dynamic_cast<DurableFlatIndex*>(writable_index_.get()))
+    throw DurabilityModeError("batch insertion is not supported in WAL mode");
   for (const VectorRecord& vector : vectors) {
     writable_index_->add(vector.id, vector.values);
     inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
@@ -177,6 +209,7 @@ SnapshotSearchResult VectorStore::search(const std::span<const float> query, con
 StoreStats VectorStore::stats() const {
   const auto observe = [this](const VectorIndex& index, const std::uint64_t version,
                               const SnapshotIdentity& identity = {}) {
+    const auto* durable = dynamic_cast<const DurableFlatIndex*>(&index);
     return StoreStats{
         index.size(),
         index.dimension(),
@@ -186,6 +219,7 @@ StoreStats VectorStore::stats() const {
         read_only_,
         version,
         identity,
+        durable ? durable->durability_stats() : DurabilityStats{},
     };
   };
   if (read_only_) {

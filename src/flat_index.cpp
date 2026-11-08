@@ -43,6 +43,13 @@ void FlatIndex::add(const VectorId id, const std::span<const float> vector) {
 
   std::vector<float> normalized = normalize_l2(vector);
 
+  add_normalized(id, normalized);
+}
+
+void FlatIndex::add_normalized(const VectorId id, const std::span<const float> normalized) {
+  // Only validated normalization and persistence paths may bypass normalization.
+  if (normalized.size() != dimension_) throw std::invalid_argument("dimension mismatch");
+
   const auto [position, inserted] = id_to_row_.emplace(id, ids_.size());
   if (!inserted) {
     throw std::invalid_argument("vector ID already exists");
