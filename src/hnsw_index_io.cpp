@@ -385,7 +385,8 @@ class HnswIndexSerializer {
     }
   }
 
-  static HnswIndex load(const std::filesystem::path& path, const DotProductKernel kernel) {
+  static HnswIndex load(const std::filesystem::path& path, const DotProductKernel kernel,
+                        ResourceLimits limits) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
       throw std::runtime_error("cannot open HNSW index for reading: " + path.string());
@@ -394,6 +395,10 @@ class HnswIndexSerializer {
     std::uint64_t stored_checksum = 0;
     const Header header = read_header(input, checksum, stored_checksum);
     validate_header(header, std::filesystem::file_size(path));
+    check_shape(limits, header.dimension, header.count);
+    if (resource_add(resource_multiply(header.payload_bytes, 16),
+                     resource_multiply(header.count, 512)) > limits.maximum_index_bytes)
+      throw ResourceExhausted();
 
     const std::size_t count = checked_size(header.count, "node count");
     const std::size_t dimension = checked_size(header.dimension, "dimension");
@@ -554,8 +559,9 @@ void save_hnsw_index(const HnswIndex& index, const std::filesystem::path& path) 
   HnswIndexSerializer::save(index, path);
 }
 
-HnswIndex load_hnsw_index(const std::filesystem::path& path, const DotProductKernel kernel) {
-  return HnswIndexSerializer::load(path, kernel);
+HnswIndex load_hnsw_index(const std::filesystem::path& path, const DotProductKernel kernel,
+                          ResourceLimits limits) {
+  return HnswIndexSerializer::load(path, kernel, limits);
 }
 
 }  // namespace fast_vector

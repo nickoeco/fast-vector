@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "fast_vector/durable_flat_index.h"
+#include "fast_vector/resource_limits.h"
 #include "fast_vector/vector_index.h"
 
 namespace fast_vector {
@@ -72,7 +73,11 @@ class ReadOnlyStoreError : public std::logic_error {
 class VectorStore {
  public:
   explicit VectorStore(std::unique_ptr<VectorIndex> index, std::size_t maximum_batch_size = 1'000,
-                       bool read_only = false, SnapshotIdentity identity = {});
+                       bool read_only = false, SnapshotIdentity identity = {},
+                       ResourceLimits limits = {}, std::shared_ptr<MemoryBudget> budget = nullptr);
+  void validate_top_k(std::size_t k) const;
+  const ResourceLimits& resource_limits() const noexcept { return limits_; }
+  std::shared_ptr<MemoryBudget> memory_budget() const noexcept { return budget_; }
 
   void add(VectorId id, std::span<const float> vector);
   /** Durable mode requires a stable client operation ID; volatile mode rejects one. */
@@ -110,6 +115,11 @@ class VectorStore {
   [[nodiscard]] bool read_only() const noexcept;
 
  private:
+  std::shared_ptr<void> reserve_index(const VectorIndex& index) const;
+  std::shared_ptr<const VectorIndex> account_index(std::shared_ptr<const VectorIndex> index) const;
+  void check_growth(std::size_t additions) const;
+  ResourceLimits limits_;
+  std::shared_ptr<MemoryBudget> budget_;
   void validate_batch(std::span<const VectorRecord> vectors) const;
   [[nodiscard]] std::shared_ptr<const ServingSnapshot> acquire_snapshot() const;
   void publish_snapshot(std::shared_ptr<const VectorIndex> snapshot,

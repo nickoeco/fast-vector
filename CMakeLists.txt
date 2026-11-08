@@ -124,6 +124,7 @@ if(FAST_VECTOR_BUILD_TESTS)
         tests/test_vector_jsonl.cpp
         tests/test_vector_store.cpp
         tests/test_search_executor.cpp
+        tests/test_resource_limits.cpp
         tools/vector_jsonl.cpp
     )
     target_include_directories(fast_vector_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

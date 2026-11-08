@@ -335,6 +335,9 @@ class RecoveryManager {
         point.size > std::max<std::uint64_t>(56, options.maximum_wal_bytes))
       invalid("recovery manifest bounds");
     const auto snapshot = checkpoint_path(options, point.lsn);
+    check_wal_shape(options.limits, options.dimension, point.lsn);
+    const auto units = snapshot_loading_units(snapshot, options.limits);
+    auto lease = options.loading_budget ? options.loading_budget->reserve(units) : nullptr;
     if (std::filesystem::file_size(snapshot) != point.size || file_hash(snapshot) != point.digest)
       invalid("checkpoint content mismatch");
     File snapshot_file(::open(snapshot.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
@@ -342,7 +345,7 @@ class RecoveryManager {
     read_all(snapshot_file.fd(), header, 0);
     if (get(header, 24) != options.dimension || get(header, 32) != point.lsn)
       invalid("checkpoint header shape mismatch");
-    index = load_flat_index(snapshot, options.kernel);
+    index = load_flat_index(snapshot, options.kernel, options.limits);
     if (index.dimension() != options.dimension || index.size() != point.lsn)
       invalid("checkpoint shape mismatch");
     return point;
@@ -420,6 +423,7 @@ class DurableFlatIndex::Impl {
     WalRecord record{};
     std::unordered_set<VectorId> seen_ids;
     while (reader.next(record)) {
+      check_wal_shape(options.limits, options.dimension, record.lsn);
       if (record.lsn <= point.lsn) {
         if (!WalIndexAccess::matches(index, record.id, record.normalized))
           invalid("checkpoint does not match WAL prefix");
@@ -462,6 +466,7 @@ class DurableFlatIndex::Impl {
         options.maximum_wal_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
         options.directory.empty() || !std::filesystem::is_directory(options.directory))
       throw std::invalid_argument("WAL requires an existing directory and bounded configuration");
+    check_wal_shape(options.limits, options.dimension, 0);
     return ::open((options.directory / "writer.lock").c_str(),
                   O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
   }
@@ -483,7 +488,8 @@ class DurableFlatIndex::Impl {
     sync(file.fd());
     sync_directory(options.directory);
   }
-  CommitResult commit(const std::string& operation_id, VectorId id, std::span<const float> vector) {
+  CommitResult commit(const std::string& operation_id, VectorId id, std::span<const float> vector,
+                      const ResourceLimits* admission) {
     if (stats.recovery_required) throw RecoveryRequiredError();
     const auto start = Clock::now();
     if (operation_id.empty() || operation_id.size() > kMaximumOperationId ||
@@ -499,6 +505,8 @@ class DurableFlatIndex::Impl {
     }
     if (WalIndexAccess::contains(index, id))
       throw std::invalid_argument("vector ID already exists");
+    check_wal_shape(options.limits, options.dimension, resource_add(index.size(), 1));
+    if (admission) check_wal_shape(*admission, options.dimension, resource_add(index.size(), 1));
     if (stats.applied_lsn == std::numeric_limits<std::uint64_t>::max())
       throw std::length_error("LSN exhausted");
     WalRecord record{stats.applied_lsn + 1, id, operation_id,
@@ -550,7 +558,7 @@ class DurableFlatIndex::Impl {
   explicit Impl(WalOptions options) : index(options.dimension) {
     throw std::runtime_error("WAL durability is supported only on Linux");
   }
-  CommitResult commit(const std::string&, VectorId, std::span<const float>) {
+  CommitResult commit(const std::string&, VectorId, std::span<const float>, const ResourceLimits*) {
     throw RecoveryRequiredError();
   }
   std::uint64_t checkpoint() { throw RecoveryRequiredError(); }
@@ -566,8 +574,9 @@ void DurableFlatIndex::add(VectorId, std::span<const float>) {
   throw std::invalid_argument("durable insertion requires a client operation ID");
 }
 CommitResult DurableFlatIndex::commit(const std::string& operation_id, VectorId id,
-                                      std::span<const float> vector) {
-  return impl_->commit(operation_id, id, vector);
+                                      std::span<const float> vector,
+                                      const ResourceLimits* admission) {
+  return impl_->commit(operation_id, id, vector, admission);
 }
 std::uint64_t DurableFlatIndex::checkpoint() { return impl_->checkpoint(); }
 DurabilityStats DurableFlatIndex::durability_stats() const noexcept { return impl_->stats; }

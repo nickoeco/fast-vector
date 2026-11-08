@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "fast_vector/flat_index.h"
+#include "fast_vector/resource_limits.h"
 
 namespace fast_vector {
 
@@ -34,6 +35,8 @@ struct WalOptions {
   std::uint64_t maximum_wal_bytes = 1024ULL * 1024 * 1024;
   DotProductKernel kernel = DotProductKernel::Scalar;
   std::function<void(WalBoundary)> fault_hook;
+  ResourceLimits limits{};
+  std::shared_ptr<MemoryBudget> loading_budget{};
 };
 
 struct CommitResult {
@@ -78,7 +81,8 @@ class DurableFlatIndex final : public VectorIndex {
   /** Reject an insertion without an operation ID; no volatile bypass exists. */
   void add(VectorId id, std::span<const float> vector) override;
   [[nodiscard]] CommitResult commit(const std::string& operation_id, VectorId id,
-                                    std::span<const float> vector);
+                                    std::span<const float> vector,
+                                    const ResourceLimits* admission = nullptr);
   /** Pause writes through the caller's lock and publish a verified recovery point. */
   [[nodiscard]] std::uint64_t checkpoint();
   [[nodiscard]] DurabilityStats durability_stats() const noexcept;

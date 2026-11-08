@@ -167,7 +167,8 @@ class FlatIndexSerializer {
     }
   }
 
-  static FlatIndex load(const std::filesystem::path& path, const DotProductKernel kernel) {
+  static FlatIndex load(const std::filesystem::path& path, const DotProductKernel kernel,
+                        ResourceLimits limits) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
       throw std::runtime_error("cannot open index for reading: " + path.string());
@@ -210,6 +211,7 @@ class FlatIndexSerializer {
     }
 
     const std::size_t dimension = to_size_t(stored_dimension, "dimension");
+    check_shape(limits, stored_dimension, stored_count);
     const std::size_t count = to_size_t(stored_count, "vector count");
     const std::size_t element_count =
         to_size_t(checked_multiply(stored_count, stored_dimension, "vector element count"),
@@ -262,8 +264,9 @@ void save_flat_index(const FlatIndex& index, const std::filesystem::path& path) 
   FlatIndexSerializer::save(index, path);
 }
 
-FlatIndex load_flat_index(const std::filesystem::path& path, const DotProductKernel kernel) {
-  return FlatIndexSerializer::load(path, kernel);
+FlatIndex load_flat_index(const std::filesystem::path& path, const DotProductKernel kernel,
+                          ResourceLimits limits) {
+  return FlatIndexSerializer::load(path, kernel, limits);
 }
 
 }  // namespace fast_vector

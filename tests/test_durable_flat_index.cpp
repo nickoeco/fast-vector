@@ -379,10 +379,15 @@ TEST(DurableFlatIndexTest, WalLimitDoesNotPoisonWriterAndSignedZeroRetriesAreBit
 
 TEST(DurableFlatIndexTest, VectorStoreSerializesCommitAndRejectsBatchBypass) {
   Directory directory;
-  VectorStore store(std::make_unique<DurableFlatIndex>(directory.options()));
+  ResourceLimits limits;
+  limits.maximum_vectors = 1;
+  VectorStore store(std::make_unique<DurableFlatIndex>(directory.options()), 1000, false, {},
+                    limits);
   EXPECT_THROW(store.add(1, kVector), std::invalid_argument);
   EXPECT_EQ(store.add(1, kVector, "one").lsn, 1);
   EXPECT_TRUE(store.add(1, kVector, "one").replayed);
+  EXPECT_THROW((void)store.add(2, kVector, "two"), ResourceExhausted);
+  EXPECT_FALSE(store.durability_stats().recovery_required);
   EXPECT_EQ(store.stats().inserted_vectors, 1);
   const std::vector<VectorRecord> batch{{2, kVector}};
   EXPECT_THROW(store.add_batch(batch), std::logic_error);
