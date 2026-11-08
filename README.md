@@ -34,6 +34,10 @@ neighbor selection, with reproducible Recall@K validation against NumPy ground t
 The gRPC transport supports insertion, non-transactional batch insertion, search, statistics,
 deadlines, bounded request messages, and the standard gRPC health protocol.
 
+Service memory admission now bounds queued input bytes, requested Top-K, index shape/estimated
+storage and overlapping snapshot/query allocations. See [memory admission](docs/memory_admission.md)
+for flags, accounting formulas and the distinction between admission credits and actual RSS.
+
 ## Requirements
 
 - CMake 3.20 or newer
