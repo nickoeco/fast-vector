@@ -46,12 +46,12 @@ class WalRecoveryIntegrationTest(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=5)
 
-    def start(self, directory):
+    def start(self, directory, extra=()):
         log = self.root / f"server-{len(self.processes)}.jsonl"
         with log.open("w") as output:
             process = subprocess.Popen([
                 str(self.server), "--address", "127.0.0.1:0", "--index", "flat",
-                "--dimension", "3", "--wal-dir", str(directory),
+                "--dimension", "3", "--wal-dir", str(directory), *extra,
             ], stdout=subprocess.DEVNULL, stderr=output)
         self.processes.append(process)
         limit = time.monotonic() + 10
@@ -126,6 +126,24 @@ class WalRecoveryIntegrationTest(unittest.TestCase):
                 process.terminate()
                 self.assertEqual(process.wait(timeout=10), 0)
                 client.close()
+
+    def test_resource_limits_preserve_wal_retries_and_reject_search(self):
+        directory=self.root/"limited"
+        directory.mkdir()
+        process,client=self.start(directory,("--max-index-vectors","1","--max-top-k","1",
+                                             "--search-queue-bytes","1"))
+        self.assertEqual(client.add(1,[1,0,0],"one").lsn,1)
+        self.assertTrue(client.add(1,[1,0,0],"one").replayed)
+        for operation in (lambda:client.add(2,[0,1,0],"two"),
+                          lambda:client.search([1,0,0],2),lambda:client.search([1,0,0],1)):
+            with self.assertRaises(grpc.RpcError) as error:
+                operation()
+            self.assertEqual(error.exception.code(),grpc.StatusCode.RESOURCE_EXHAUSTED)
+        stats=client.stats()
+        self.assertEqual(stats.durability.applied_lsn,1)
+        self.assertFalse(stats.durability.recovery_required)
+        self.assertEqual(stats.search_executor.queued_bytes,0)
+        self.assertEqual(stats.search_executor.queue_byte_limit,1)
 
     def test_corrupt_complete_record_prevents_server_listening(self):
         directory = self.root / "corrupt"

@@ -34,7 +34,8 @@ void validate_manifest(const v1::SnapshotManifest& manifest, const std::string& 
                        std::uint64_t maximum_bytes);
 [[nodiscard]] std::unique_ptr<VectorIndex> load_verified_snapshot(
     const std::filesystem::path& path, const v1::SnapshotManifest& manifest,
-    const std::string& index_type, DotProductKernel kernel, std::uint64_t maximum_bytes);
+    const std::string& index_type, DotProductKernel kernel, std::uint64_t maximum_bytes,
+    ResourceLimits limits = {});
 [[nodiscard]] SnapshotIdentity snapshot_identity(const v1::SnapshotManifest& manifest,
                                                  std::uint64_t generation);
 

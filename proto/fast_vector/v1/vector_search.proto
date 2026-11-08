@@ -124,6 +124,9 @@ message SearchExecutorStats {
   uint64 expired = 14;
   uint64 queue_us_total = 15;
   uint64 execution_us_total = 16;
+  uint64 queued_bytes = 17;
+  uint64 peak_queued_bytes = 18;
+  uint64 queue_byte_limit = 19;
 }
 
 message GetStatsRequest {}
@@ -140,6 +143,10 @@ message GetStatsResponse {
   uint64 snapshot_version = 9;
   PublicationStatus publication = 10;
   DurabilityStats durability = 11;
+  uint64 snapshot_accounted_bytes = 12;
+  uint64 snapshot_budget_bytes = 13;
+  uint64 maximum_top_k = 14;
+  uint64 maximum_index_vectors = 15;
 }
 
 service VectorSearchService {

@@ -207,4 +207,19 @@ TEST(SnapshotPublicationTest, DisabledPublicationAndPrivateStagingCleanup) {
   }
   EXPECT_FALSE(std::filesystem::exists(path));
 }
+TEST(SnapshotPublicationTest, LoadingBudgetFailurePreservesServingVersionAndReleasesLease) {
+  Artifacts files;
+  const auto a = files.save(false, "a", 1), b = files.save(false, "b", 2);
+  auto budget = std::make_shared<MemoryBudget>(2000);
+  auto store = std::make_shared<VectorStore>(
+      std::make_unique<FlatIndex>(load_flat_index(files.directory / "a")), 10, true,
+      snapshot_identity(a, 1), ResourceLimits{}, budget);
+  SnapshotPublication publication(store, "flat", {.enabled = true});
+  const auto token = publication.begin(b, 2);
+  EXPECT_THROW(publication.complete(files.directory / "b", token), ResourceExhausted);
+  publication.fail(token);
+  EXPECT_EQ(budget->used(), 520);
+  EXPECT_EQ(publication.status().current().generation(), 1);
+  EXPECT_EQ(store->search(std::vector<float>{1, 0}, 1).at(0).id, 1);
+}
 }  // namespace

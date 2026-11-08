@@ -90,7 +90,8 @@ std::unique_ptr<VectorIndex> load_verified_snapshot(const std::filesystem::path&
                                                     const v1::SnapshotManifest& manifest,
                                                     const std::string& index_type,
                                                     DotProductKernel kernel,
-                                                    std::uint64_t maximum_bytes) {
+                                                    std::uint64_t maximum_bytes,
+                                                    ResourceLimits limits) {
   validate_manifest(manifest, index_type, maximum_bytes);
   if (std::filesystem::file_size(path) != manifest.file_size() ||
       sha256_file(path) != manifest.sha256()) {
@@ -107,9 +108,9 @@ std::unique_ptr<VectorIndex> load_verified_snapshot(const std::filesystem::path&
     throw std::invalid_argument("snapshot format version mismatch");
   std::unique_ptr<VectorIndex> index;
   if (index_type == "flat")
-    index = std::make_unique<FlatIndex>(load_flat_index(path, kernel));
+    index = std::make_unique<FlatIndex>(load_flat_index(path, kernel, limits));
   else
-    index = std::make_unique<HnswIndex>(load_hnsw_index(path, kernel));
+    index = std::make_unique<HnswIndex>(load_hnsw_index(path, kernel, limits));
   if (index->dimension() != manifest.dimension() || index->size() != manifest.vector_count()) {
     throw std::invalid_argument("snapshot shape does not match manifest");
   }
@@ -140,6 +141,7 @@ std::uint64_t SnapshotPublication::begin(const v1::SnapshotManifest& manifest,
                                          std::uint64_t generation) {
   if (!config_.enabled) throw PublicationDisabledError();
   validate_manifest(manifest, index_type_, config_.maximum_file_bytes);
+  check_shape(store_->resource_limits(), manifest.dimension(), manifest.vector_count());
   std::lock_guard lock(mutex_);
   if (status_.state() == "PREPARING") throw PublicationBusyError();
   const auto current = store_->serving_snapshot();
@@ -172,6 +174,8 @@ std::uint64_t SnapshotPublication::begin(const v1::SnapshotManifest& manifest,
 }
 
 void SnapshotPublication::complete(const std::filesystem::path& path, std::uint64_t token) {
+  const auto loading =
+      store_->memory_budget()->reserve(snapshot_loading_units(path, store_->resource_limits()));
   v1::SnapshotManifest manifest;
   std::uint64_t generation;
   {
@@ -181,7 +185,7 @@ void SnapshotPublication::complete(const std::filesystem::path& path, std::uint6
     generation = generation_;
   }
   auto index = load_verified_snapshot(path, manifest, index_type_, config_.kernel,
-                                      config_.maximum_file_bytes);
+                                      config_.maximum_file_bytes, store_->resource_limits());
   auto prepared =
       store_->prepare_snapshot(std::move(index), snapshot_identity(manifest, generation));
   std::lock_guard lock(mutex_);

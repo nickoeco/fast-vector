@@ -72,6 +72,9 @@ struct ServerConfig {
   std::optional<fast_vector::v1::SnapshotManifest> manifest;
   std::string wal_directory;
   std::uint64_t maximum_wal_bytes = 1024ULL * 1024 * 1024;
+  fast_vector::ResourceLimits limits;
+  std::shared_ptr<fast_vector::MemoryBudget> memory_budget;
+  std::uint64_t snapshot_memory_bytes = 2ULL * 1024 * 1024 * 1024;
 };
 
 bool parse_bool(const std::string_view value, const std::string& option) {
@@ -118,6 +121,18 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
       }
     } else if (option == "--dimension") {
       config.dimension = parse_positive_size(value, option);
+    } else if (option == "--max-index-vectors") {
+      config.limits.maximum_vectors = parse_positive_size(value, option);
+    } else if (option == "--max-index-bytes") {
+      config.limits.maximum_index_bytes = parse_positive_size(value, option);
+    } else if (option == "--max-dimension") {
+      config.limits.maximum_dimension = parse_positive_size(value, option);
+    } else if (option == "--max-top-k") {
+      config.limits.maximum_top_k = parse_positive_size(value, option);
+    } else if (option == "--snapshot-memory-bytes" || option == "--memory-budget-bytes") {
+      config.snapshot_memory_bytes = parse_positive_size(value, option);
+    } else if (option == "--search-queue-bytes") {
+      config.search.queue_bytes = parse_positive_size(value, option);
     } else if (option == "--max-batch-size") {
       config.maximum_batch_size = parse_positive_size(value, option);
     } else if (option == "--search-workers") {
@@ -190,6 +205,7 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
     throw std::invalid_argument("--address must not be empty");
   }
   config.publication.kernel = config.kernel;
+  config.memory_budget = std::make_shared<fast_vector::MemoryBudget>(config.snapshot_memory_bytes);
   if (!config.wal_directory.empty() &&
       (config.index_type != "flat" || config.read_only || !config.load_index_path.empty() ||
        config.reload_on_sighup || !config.snapshot_manifest_path.empty() || config.generation ||
@@ -226,24 +242,30 @@ std::unique_ptr<fast_vector::VectorIndex> load_snapshot(
       {{"operation", operation}});
   const auto start = std::chrono::steady_clock::now();
   try {
+    fast_vector::service::SnapshotStagingFile staging(config.publication.staging_directory);
+    if (std::filesystem::file_size(config.load_index_path) > config.publication.maximum_file_bytes)
+      throw fast_vector::ResourceExhausted();
+    std::filesystem::copy_file(config.load_index_path, staging.path(),
+                               std::filesystem::copy_options::overwrite_existing);
+    if (std::filesystem::file_size(staging.path()) > config.publication.maximum_file_bytes)
+      throw fast_vector::ResourceExhausted();
+    const auto loading = config.memory_budget->reserve(
+        fast_vector::snapshot_loading_units(staging.path(), config.limits));
     std::unique_ptr<fast_vector::VectorIndex> index;
     if (!config.snapshot_manifest_path.empty()) {
-      fast_vector::service::SnapshotStagingFile staging(config.publication.staging_directory);
       if (std::filesystem::file_size(config.load_index_path) >
           config.publication.maximum_file_bytes) {
         throw std::invalid_argument("snapshot exceeds file limit");
       }
-      std::filesystem::copy_file(config.load_index_path, staging.path(),
-                                 std::filesystem::copy_options::overwrite_existing);
-      index = fast_vector::service::load_verified_snapshot(staging.path(), *config.manifest,
-                                                           config.index_type, config.kernel,
-                                                           config.publication.maximum_file_bytes);
+      index = fast_vector::service::load_verified_snapshot(
+          staging.path(), *config.manifest, config.index_type, config.kernel,
+          config.publication.maximum_file_bytes, config.limits);
     } else if (config.index_type == "flat") {
       index = std::make_unique<fast_vector::FlatIndex>(
-          fast_vector::load_flat_index(config.load_index_path, config.kernel));
+          fast_vector::load_flat_index(staging.path(), config.kernel, config.limits));
     } else {
       index = std::make_unique<fast_vector::HnswIndex>(
-          fast_vector::load_hnsw_index(config.load_index_path, config.kernel));
+          fast_vector::load_hnsw_index(staging.path(), config.kernel, config.limits));
     }
     logger.write(
         {.event = "index_load_completed",
@@ -276,7 +298,9 @@ std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config,
                                 .dimension = config.dimension,
                                 .maximum_wal_bytes = config.maximum_wal_bytes,
                                 .kernel = config.kernel,
-                                .fault_hook = {}});
+                                .fault_hook = {},
+                                .limits = config.limits,
+                                .loading_budget = config.memory_budget});
     const auto stats = index->durability_stats();
     logger.write({.event = "wal_recovery_completed",
                   .status = "OK",
@@ -291,6 +315,7 @@ std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config,
   if (!config.load_index_path.empty()) {
     return load_snapshot(config, logger, "startup");
   }
+  fast_vector::check_shape(config.limits, config.dimension, 0);
   if (config.index_type == "flat") {
     return std::make_unique<fast_vector::FlatIndex>(config.dimension, config.kernel);
   }
@@ -315,7 +340,9 @@ constexpr char kUsage[] =
     "[--search-workers N] [--search-queue-capacity N] [--search-check-interval N] "
     "[--snapshot-manifest PATH] [--generation G] [--enable-snapshot-publication true|false] "
     "[--max-snapshot-bytes N] [--snapshot-staging-dir PATH] "
-    "[--wal-dir EXISTING_DIRECTORY] [--max-wal-bytes N]";
+    "[--wal-dir EXISTING_DIRECTORY] [--max-wal-bytes N] "
+    "[--search-queue-bytes N] [--max-top-k K] [--max-index-vectors N] "
+    "[--max-dimension D] [--max-index-bytes N] [--memory-budget-bytes N]";
 
 void log_config(const ServerConfig& config, const fast_vector::VectorIndex& index,
                 StructuredLogger& logger) {
@@ -354,6 +381,13 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
   logger.write({.event = "durability_config", .index_type = config.index_type},
                {{"wal_enabled", !config.wal_directory.empty()},
                 {"maximum_wal_bytes", config.maximum_wal_bytes}});
+  logger.write({.event = "resource_limits", .index_type = config.index_type},
+               {{"max_dimension", config.limits.maximum_dimension},
+                {"max_vectors", config.limits.maximum_vectors},
+                {"max_index_bytes", config.limits.maximum_index_bytes},
+                {"max_top_k", config.limits.maximum_top_k},
+                {"queue_bytes", static_cast<std::uint64_t>(config.search.queue_bytes)},
+                {"snapshot_memory_bytes", config.snapshot_memory_bytes}});
 }
 
 }  // namespace
@@ -377,7 +411,8 @@ int main(const int argc, char* argv[]) {
       identity = fast_vector::service::snapshot_identity(*config.manifest, config.generation);
     }
     auto store = std::make_shared<fast_vector::VectorStore>(
-        std::move(index), config.maximum_batch_size, config.read_only, std::move(identity));
+        std::move(index), config.maximum_batch_size, config.read_only, std::move(identity),
+        config.limits, config.memory_budget);
     fast_vector::service::VectorSearchService vector_service(store, config.index_type, logger,
                                                              config.search, config.publication);
     if (stop_requested.load(std::memory_order_relaxed) != 0) {

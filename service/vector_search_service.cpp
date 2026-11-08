@@ -187,6 +187,8 @@ grpc::Status VectorSearchService::Search(grpc::ServerContext* context,
   }
   try {
     const auto query = std::span<const float>(request->query().data(), request->query().size());
+    store_->validate_top_k(request->k());
+    if (query.size() > store_->resource_limits().maximum_dimension) throw ResourceExhausted();
     if (request->k() != 0) {
       if (request->expected_snapshot_id().empty() && query.size() != store_->dimension()) {
         throw std::invalid_argument("query dimension does not match index dimension");
@@ -304,7 +306,8 @@ grpc::Status VectorSearchService::PrepareSnapshot(
       logger_->write(
           {.severity = "ERROR", .event = "snapshot_prepare_failed", .index_type = index_type_},
           {{"generation", generation}});
-    if (dynamic_cast<const std::bad_alloc*>(&error)) {
+    if (dynamic_cast<const std::bad_alloc*>(&error) ||
+        dynamic_cast<const ResourceExhausted*>(&error)) {
       return finish_rpc(call,
                         {grpc::StatusCode::RESOURCE_EXHAUSTED, "snapshot resources unavailable"});
     }
@@ -386,6 +389,13 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     scheduling->set_expired(scheduler.expired);
     scheduling->set_queue_us_total(scheduler.queue_us_total);
     scheduling->set_execution_us_total(scheduler.execution_us_total);
+    scheduling->set_queued_bytes(scheduler.queued_bytes);
+    scheduling->set_peak_queued_bytes(scheduler.peak_queued_bytes);
+    scheduling->set_queue_byte_limit(scheduler.queue_byte_limit);
+    response->set_snapshot_accounted_bytes(store_->memory_budget()->used());
+    response->set_snapshot_budget_bytes(store_->memory_budget()->limit());
+    response->set_maximum_top_k(store_->resource_limits().maximum_top_k);
+    response->set_maximum_index_vectors(store_->resource_limits().maximum_vectors);
     return finish_rpc(call, grpc::Status::OK);
   } catch (const std::exception& error) {
     return finish_rpc(call, exception_status(error));
@@ -400,6 +410,8 @@ grpc::Status VectorSearchService::cancelled_status(const grpc::ServerContext& co
 }
 
 grpc::Status VectorSearchService::exception_status(const std::exception& error) {
+  if (dynamic_cast<const ResourceExhausted*>(&error) || dynamic_cast<const std::bad_alloc*>(&error))
+    return {grpc::StatusCode::RESOURCE_EXHAUSTED, "resource budget exceeded"};
   if (dynamic_cast<const RecoveryRequiredError*>(&error)) {
     return {grpc::StatusCode::FAILED_PRECONDITION, "durable writer requires recovery"};
   }
