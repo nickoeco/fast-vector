@@ -13,11 +13,13 @@ std::uint64_t microseconds(SearchContext::Clock::duration duration) {
 
 SearchExecutor::SearchExecutor(std::shared_ptr<VectorStore> store, SearchExecutorConfig config)
     : store_(std::move(store)), config_(config) {
-  if (!store_ || config.workers == 0 || config.queue_capacity == 0 || config.check_interval == 0) {
+  if (!store_ || config.workers == 0 || config.queue_capacity == 0 || config.check_interval == 0 ||
+      config.queue_bytes == 0) {
     throw std::invalid_argument("search executor requires a store and positive limits");
   }
   stats_.workers = config.workers;
   stats_.queue_capacity = config.queue_capacity;
+  stats_.queue_byte_limit = config.queue_bytes;
   active_.resize(config.workers);
   workers_.reserve(config.workers);
   try {
@@ -41,14 +43,26 @@ SearchTicket SearchExecutor::submit(std::vector<float> query, std::size_t k,
   task->context.expected_snapshot_id = std::move(expected_snapshot_id);
   auto future = task->promise.get_future();
   auto cancellation = task->context.cancellation;
+  task->bytes = resource_add(resource_add(resource_multiply(task->query.capacity(), sizeof(float)),
+                                          task->context.expected_snapshot_id.capacity()),
+                             sizeof(SearchTask));
+  store_->validate_top_k(k);
+  // Include retained input, result/heap growth and a bounded per-search scratch allowance.
+  task->memory_lease = store_->memory_budget()->reserve(resource_add(
+      task->bytes, resource_add(resource_multiply(k, 64),
+                                resource_multiply(store_->resource_limits().maximum_vectors, 16))));
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || queue_.size() >= config_.queue_capacity) {
+    if (stopping_ || queue_.size() >= config_.queue_capacity ||
+        task->bytes > config_.queue_bytes - stats_.queued_bytes) {
       ++stats_.rejected;
       throw SearchRejected(stopping_);
     }
     task->enqueued = SearchContext::Clock::now();
+    const auto bytes = task->bytes;
     queue_.push_back(std::move(task));
+    stats_.queued_bytes += bytes;
+    stats_.peak_queued_bytes = std::max(stats_.peak_queued_bytes, stats_.queued_bytes);
     ++stats_.admitted;
     stats_.queued = queue_.size();
     stats_.peak_queued = std::max(stats_.peak_queued, stats_.queued);
@@ -58,6 +72,7 @@ SearchTicket SearchExecutor::submit(std::vector<float> query, std::size_t k,
 }
 
 void SearchExecutor::finish_locked(SearchTask& task, SearchOutcome outcome) {
+  outcome.memory_lease = std::move(task.memory_lease);
   ++stats_.completed;
   stats_.queue_us_total += outcome.queue_us;
   stats_.execution_us_total += outcome.execution_us;
@@ -101,6 +116,7 @@ void SearchExecutor::cancel(const std::shared_ptr<SearchCancellation>& cancellat
   });
   if (found != queue_.end()) {
     auto task = std::move(*found);
+    stats_.queued_bytes -= task->bytes;
     queue_.erase(found);
     stats_.queued = queue_.size();
     cancel_waiting_locked(*task);
@@ -118,6 +134,7 @@ void SearchExecutor::stop() {
     // Promise fulfillment does not run user continuations inline.
     while (!queue_.empty()) {
       auto task = std::move(queue_.front());
+      stats_.queued_bytes -= task->bytes;
       queue_.pop_front();
       stats_.queued = queue_.size();
       task->context.cancellation->request(SearchStopReason::Shutdown);
@@ -147,6 +164,7 @@ void SearchExecutor::run(std::size_t worker) {
       ready_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
       if (queue_.empty()) return;
       task = std::move(queue_.front());
+      stats_.queued_bytes -= task->bytes;
       queue_.pop_front();
       stats_.queued = queue_.size();
       active_[worker] = task->context.cancellation;

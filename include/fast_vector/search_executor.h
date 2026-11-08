@@ -17,6 +17,7 @@ struct SearchExecutorConfig {
   std::size_t workers = 2;
   std::size_t queue_capacity = 64;
   std::size_t check_interval = 64;
+  std::size_t queue_bytes = 64ULL * 1024 * 1024;
 };
 
 class SearchRejected final : public std::exception {
@@ -30,6 +31,7 @@ class SearchRejected final : public std::exception {
 };
 
 struct SearchOutcome {
+  std::shared_ptr<void> memory_lease{};
   SnapshotSearchResult result;
   std::uint64_t queue_us = 0;
   std::uint64_t execution_us = 0;
@@ -48,6 +50,7 @@ struct SearchExecutorStats {
   std::uint64_t admitted = 0, rejected = 0, started = 0, completed = 0;
   std::uint64_t succeeded = 0, failed = 0, cancelled = 0, expired = 0;
   std::uint64_t queue_us_total = 0, execution_us_total = 0;
+  std::uint64_t queued_bytes = 0, peak_queued_bytes = 0, queue_byte_limit = 0;
 };
 
 /** Bounded FIFO computation scheduler. Tasks own their input; no transport objects cross threads.
@@ -78,6 +81,8 @@ class SearchExecutor {
     SearchContext context;
     SearchContext::Clock::time_point enqueued;
     std::promise<SearchOutcome> promise;
+    std::size_t bytes = 0;
+    std::shared_ptr<void> memory_lease;
   };
   void run(std::size_t worker);
   void finish_locked(SearchTask& task, SearchOutcome outcome);

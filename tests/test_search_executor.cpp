@@ -341,4 +341,38 @@ TEST(SearchContextTest, EnabledChecksPreserveBuiltinResultsAcrossBatchSizes) {
     }
   }
 }
+TEST(SearchExecutorTest, ByteAdmissionAndCancellationReleaseWaitingInput) {
+  auto gate = std::make_shared<Gate>();
+  ReleaseOnExit release{gate};
+  SearchExecutor executor(controlled_store(gate),
+                          {.workers = 1, .queue_capacity = 8, .queue_bytes = 4096});
+  auto active = executor.submit({1, 0}, 1);
+  ASSERT_TRUE(gate->wait_for_calls(1));
+  auto waiting = executor.submit(std::vector<float>(800, 2), 1);
+  const auto bytes = executor.stats().queued_bytes;
+  EXPECT_GT(bytes, 3200);
+  EXPECT_LE(bytes, 4096);
+  EXPECT_THROW((void)executor.submit(std::vector<float>(800, 2), 1), SearchRejected);
+  executor.cancel(waiting.cancellation, SearchStopReason::Cancelled);
+  EXPECT_EQ(executor.stats().queued_bytes, 0);
+  auto replacement = executor.submit(std::vector<float>(800, 2), 1);
+  executor.stop();
+  EXPECT_EQ(executor.stats().queued_bytes, 0);
+  gate->release();
+  executor.shutdown();
+  EXPECT_EQ(executor.stats().peak_queued_bytes, bytes);
+}
+TEST(SearchExecutorTest, SharedBudgetRejectsBeforeEnqueueWithoutLeakingCredits) {
+  auto graph = std::make_unique<FlatIndex>(2);
+  graph->add(1, std::vector<float>{1, 0});
+  ResourceLimits limits;
+  limits.maximum_vectors = 1;
+  auto budget = std::make_shared<MemoryBudget>(800);
+  auto store =
+      std::make_shared<VectorStore>(std::move(graph), 10, true, SnapshotIdentity{}, limits, budget);
+  SearchExecutor executor(store, {.workers = 1});
+  EXPECT_THROW((void)executor.submit(std::vector<float>(100, 1), 1), ResourceExhausted);
+  EXPECT_EQ(executor.stats().admitted, 0);
+  EXPECT_EQ(budget->used(), 520);
+}
 }  // namespace
