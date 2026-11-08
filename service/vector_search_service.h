@@ -43,6 +43,8 @@ class VectorSearchService final : public v1::VectorSearchService::Service {
                       v1::SearchResponse* response) override;
   grpc::Status GetStats(grpc::ServerContext* context, const v1::GetStatsRequest* request,
                         v1::GetStatsResponse* response) override;
+  grpc::Status Checkpoint(grpc::ServerContext* context, const v1::CheckpointRequest* request,
+                          v1::CheckpointResponse* response) override;
   grpc::Status PrepareSnapshot(grpc::ServerContext* context,
                                grpc::ServerReader<v1::PrepareSnapshotRequest>* reader,
                                v1::PublicationStatus* response) override;

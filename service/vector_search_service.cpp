@@ -127,9 +127,25 @@ grpc::Status VectorSearchService::AddVector(grpc::ServerContext* context,
   }
   try {
     const v1::Vector& vector = request->vector();
-    store_->add(vector.id(),
-                std::span<const float>(vector.values().data(), vector.values().size()));
-    response->set_index_size(store_->stats().index_size);
+    const auto result = store_->add(
+        vector.id(), std::span<const float>(vector.values().data(), vector.values().size()),
+        request->client_operation_id());
+    response->set_index_size(result.index_size);
+    response->set_lsn(result.lsn);
+    response->set_replayed(result.replayed);
+    return finish_rpc(call, grpc::Status::OK);
+  } catch (const std::exception& error) {
+    return finish_rpc(call, exception_status(error));
+  }
+}
+
+grpc::Status VectorSearchService::Checkpoint(grpc::ServerContext* context,
+                                             const v1::CheckpointRequest*,
+                                             v1::CheckpointResponse* response) {
+  const auto call = begin_rpc("Checkpoint");
+  if (context->IsCancelled()) return finish_rpc(call, cancelled_status(*context));
+  try {
+    response->set_lsn(store_->checkpoint());
     return finish_rpc(call, grpc::Status::OK);
   } catch (const std::exception& error) {
     return finish_rpc(call, exception_status(error));
@@ -340,6 +356,18 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     response->set_read_only(stats.read_only);
     response->set_snapshot_version(stats.snapshot_version);
     *response->mutable_publication() = std::move(publication);
+    const auto& durability = stats.durability;
+    auto* durable = response->mutable_durability();
+    durable->set_enabled(durability.enabled);
+    durable->set_recovery_required(durability.recovery_required);
+    durable->set_applied_lsn(durability.applied_lsn);
+    durable->set_checkpoint_lsn(durability.checkpoint_lsn);
+    durable->set_recovered_records(durability.recovered_records);
+    durable->set_discarded_tail_bytes(durability.discarded_tail_bytes);
+    durable->set_recovery_us(durability.recovery_us);
+    durable->set_last_sync_us(durability.last_sync_us);
+    durable->set_last_write_us(durability.last_write_us);
+    durable->set_last_checkpoint_us(durability.last_checkpoint_us);
     const auto scheduler = executor_->stats();
     auto* scheduling = response->mutable_search_executor();
     scheduling->set_workers(scheduler.workers);
@@ -372,6 +400,12 @@ grpc::Status VectorSearchService::cancelled_status(const grpc::ServerContext& co
 }
 
 grpc::Status VectorSearchService::exception_status(const std::exception& error) {
+  if (dynamic_cast<const RecoveryRequiredError*>(&error)) {
+    return {grpc::StatusCode::FAILED_PRECONDITION, "durable writer requires recovery"};
+  }
+  if (dynamic_cast<const DurabilityModeError*>(&error)) {
+    return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+  }
   if (dynamic_cast<const PublicationDisabledError*>(&error)) {
     return {grpc::StatusCode::FAILED_PRECONDITION, "snapshot publication is disabled"};
   }

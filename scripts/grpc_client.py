@@ -59,10 +59,13 @@ class VectorSearchClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def add(self, vector_id: int, values: Sequence[float]):
+    def add(self, vector_id: int, values: Sequence[float], client_operation_id: str = ""):
         vector = self._messages.Vector(id=vector_id, values=values)
-        request = self._messages.AddVectorRequest(vector=vector)
+        request = self._messages.AddVectorRequest(vector=vector, client_operation_id=client_operation_id)
         return self._stub.AddVector(request, timeout=self._timeout_seconds)
+
+    def checkpoint(self):
+        return self._stub.Checkpoint(self._messages.CheckpointRequest(), timeout=self._timeout_seconds)
 
     def add_batch(self, vectors: Sequence[tuple[int, Sequence[float]]]):
         request = self._messages.BatchAddRequest(
@@ -99,7 +102,11 @@ def response_to_dictionary(response: object) -> dict[str, object]:
             ]
         }
     fields = response.DESCRIPTOR.fields
-    return {field.name: getattr(response, field.name) for field in fields}
+    return {
+        field.name: (response_to_dictionary(getattr(response, field.name))
+                     if field.message_type is not None else getattr(response, field.name))
+        for field in fields
+    }
 
 
 def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
@@ -115,6 +122,7 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     add_parser = subparsers.add_parser("add")
     add_parser.add_argument("--id", type=int, required=True)
     add_parser.add_argument("--vector", type=parse_vector, required=True)
+    add_parser.add_argument("--operation-id", default="")
 
     batch_parser = subparsers.add_parser("batch-add")
     batch_parser.add_argument(
@@ -127,6 +135,7 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     search_parser.add_argument("--expected-snapshot-id", default="")
 
     subparsers.add_parser("stats")
+    subparsers.add_parser("checkpoint")
     return parser.parse_args(arguments)
 
 
@@ -134,13 +143,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
     options = parse_arguments(arguments)
     with VectorSearchClient(options.address, options.generated_dir, options.timeout) as client:
         if options.command == "add":
-            response = client.add(options.id, options.vector)
+            response = client.add(options.id, options.vector, options.operation_id)
         elif options.command == "batch-add":
             records = json.loads(options.input.read_text(encoding="utf-8"))
             vectors = [(record["id"], record["values"]) for record in records]
             response = client.add_batch(vectors)
         elif options.command == "search":
             response = client.search(options.query, options.k, options.expected_snapshot_id)
+        elif options.command == "checkpoint":
+            response = client.checkpoint()
         else:
             response = client.stats()
     print(json.dumps(response_to_dictionary(response), indent=2, sort_keys=True))

@@ -70,6 +70,8 @@ struct ServerConfig {
   std::string snapshot_manifest_path;
   std::uint64_t generation = 0;
   std::optional<fast_vector::v1::SnapshotManifest> manifest;
+  std::string wal_directory;
+  std::uint64_t maximum_wal_bytes = 1024ULL * 1024 * 1024;
 };
 
 bool parse_bool(const std::string_view value, const std::string& option) {
@@ -161,6 +163,11 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
       if (config.load_index_path.empty()) {
         throw std::invalid_argument("--load-index must not be empty");
       }
+    } else if (option == "--wal-dir") {
+      config.wal_directory = value;
+      if (value.empty()) throw std::invalid_argument("--wal-dir must not be empty");
+    } else if (option == "--max-wal-bytes") {
+      config.maximum_wal_bytes = parse_positive_size(value, option);
     } else if (option == "--read-only") {
       config.read_only = parse_bool(value, option);
     } else if (option == "--snapshot-manifest") {
@@ -183,6 +190,12 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
     throw std::invalid_argument("--address must not be empty");
   }
   config.publication.kernel = config.kernel;
+  if (!config.wal_directory.empty() &&
+      (config.index_type != "flat" || config.read_only || !config.load_index_path.empty() ||
+       config.reload_on_sighup || !config.snapshot_manifest_path.empty() || config.generation ||
+       config.publication.enabled)) {
+    throw std::invalid_argument("WAL requires writable Flat without snapshot loading/publication");
+  }
   if ((!config.snapshot_manifest_path.empty() || config.generation != 0 ||
        config.publication.enabled) &&
       (config.snapshot_manifest_path.empty() || config.generation == 0 || !config.read_only ||
@@ -256,6 +269,25 @@ std::unique_ptr<fast_vector::VectorIndex> load_snapshot(
 
 std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config,
                                                      StructuredLogger& logger) {
+  if (!config.wal_directory.empty()) {
+    logger.write({.event = "wal_recovery_started", .index_type = "flat"});
+    auto index = std::make_unique<fast_vector::DurableFlatIndex>(
+        fast_vector::WalOptions{.directory = config.wal_directory,
+                                .dimension = config.dimension,
+                                .maximum_wal_bytes = config.maximum_wal_bytes,
+                                .kernel = config.kernel,
+                                .fault_hook = {}});
+    const auto stats = index->durability_stats();
+    logger.write({.event = "wal_recovery_completed",
+                  .status = "OK",
+                  .latency_us = stats.recovery_us,
+                  .index_type = "flat",
+                  .vector_count = index->size()},
+                 {{"applied_lsn", stats.applied_lsn},
+                  {"checkpoint_lsn", stats.checkpoint_lsn},
+                  {"discarded_tail_bytes", stats.discarded_tail_bytes}});
+    return index;
+  }
   if (!config.load_index_path.empty()) {
     return load_snapshot(config, logger, "startup");
   }
@@ -282,7 +314,8 @@ constexpr char kUsage[] =
     "[--read-only true|false] [--reload-on-sighup true|false] "
     "[--search-workers N] [--search-queue-capacity N] [--search-check-interval N] "
     "[--snapshot-manifest PATH] [--generation G] [--enable-snapshot-publication true|false] "
-    "[--max-snapshot-bytes N] [--snapshot-staging-dir PATH]";
+    "[--max-snapshot-bytes N] [--snapshot-staging-dir PATH] "
+    "[--wal-dir EXISTING_DIRECTORY] [--max-wal-bytes N]";
 
 void log_config(const ServerConfig& config, const fast_vector::VectorIndex& index,
                 StructuredLogger& logger) {
@@ -318,6 +351,9 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
                 .index_type = config.index_type,
                 .vector_count = index.size()},
                std::span<const LogField>(fields).first(hnsw ? 19 : 14));
+  logger.write({.event = "durability_config", .index_type = config.index_type},
+               {{"wal_enabled", !config.wal_directory.empty()},
+                {"maximum_wal_bytes", config.maximum_wal_bytes}});
 }
 
 }  // namespace
