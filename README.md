@@ -25,10 +25,11 @@ a from-scratch approximate HNSW index using cosine similarity.
 - Thread-safe `VectorStore` application layer with serialized insertion and concurrent search
 - Optional synchronous gRPC server with protobuf code generation and standard health checks
 - Opt-in read-only multi-replica publication with SHA-256 manifests, generation fencing and rollback
+- Opt-in single-writer Flat WAL with per-operation synchronization, persistent retry IDs and checkpoints
 
 Service deletion, authentication, TLS, and metadata storage are not implemented yet.
-Persistence currently means complete FlatIndex and HnswIndex snapshots; incremental
-persistence is not implemented. HNSW supports both simple nearest-M and diversity-aware
+Persistence includes complete FlatIndex/HnswIndex snapshots and an optional Linux Flat insertion
+WAL; HNSW incremental recovery is not implemented. HNSW supports both simple nearest-M and diversity-aware
 neighbor selection, with reproducible Recall@K validation against NumPy ground truth.
 The gRPC transport supports insertion, non-transactional batch insertion, search, statistics,
 deadlines, bounded request messages, and the standard gRPC health protocol.
@@ -168,7 +169,8 @@ IDs, topology, tombstones, entry point, and RNG state are unchanged. Internal ca
 may change. A rollback journal copies only touched adjacency lists, including reverse edges;
 it never allocates during rollback. A separate test executable injects persistent allocation
 failure at each ordinary C++ allocation point for the covered scenarios, checks snapshot/query
-equality, and retries insertion. The library has no fault-injection hooks. Batch insertion
+equality, and retries insertion. HNSW has no fault-injection hooks; the WAL coordinator has
+optional boundary callbacks for fault tests. Batch insertion
 remains nontransactional across multiple successful `add()` calls.
 
 To compact a snapshot on Linux:
@@ -350,8 +352,24 @@ artifact/manifest/generation in deployment configuration. See [snapshot publicat
 for the protocol, commands, consistency boundary and measured three-process acceptance tests.
 
 The server enables gRPC's standard health-check service. Transport security, authentication,
-persistence during service operation, writable hot reload, reflection, and production observability
-remain outside this phase.
+writable hot reload, reflection, and production observability remain outside this phase.
+
+### Durable Flat insertion and recovery
+
+Linux `--index flat --wal-dir EXISTING_PRIVATE_DIRECTORY --dimension D` enables a single-writer
+WAL. Each AddVector must include `client_operation_id` (Python: `--operation-id`). Success means
+the WAL record was synchronized with `fdatasync` and applied to the index. Retrying the exact
+same operation returns its original LSN and result; conflicting reuse is rejected. BatchAdd,
+HNSW, deletion, read-only mode and snapshot reload/publication are not supported in this mode.
+Without `--wal-dir`, insertion remains volatile.
+
+The `Checkpoint` RPC pauses writes and safely publishes a snapshot and recovery manifest.
+Startup validates and restores the index and retry table before listening. A sync or post-sync
+application failure stops writes until restart. The entire WAL is retained in this first version;
+checkpoints do not yet eliminate its scan or bound disk/retry-table growth. A configured WAL
+byte limit refuses new operations rather than deleting history. See
+[WAL recovery](docs/wal_recovery.md) for the binary format, failure contract, storage assumptions,
+commands, fault tests and process-termination versus power-loss boundary.
 
 The Python integration suite also exercises the complete snapshot-serving path: it builds a
 FlatIndex snapshot from `tests/data/vectors.jsonl`, starts a server on a dynamic local port,

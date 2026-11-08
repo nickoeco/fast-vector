@@ -136,6 +136,17 @@ data and the process-local high-water fence. There is no cross-replica atomic co
 or durable control journal. Restart uses an explicit current bootstrap configuration. See
 [snapshot publication](snapshot_publication.md) for framing, fencing and recovery semantics.
 
+## Writable Flat recovery
+
+The optional `DurableFlatIndex` coordinator implements VectorIndex search around an owned
+FlatIndex while refusing the operation-ID-free add API. VectorStore serializes durable commits
+and checkpoint publication under its existing exclusive lock. Every operation appends and
+fdatasyncs original/normalized float bits before applying the latter to memory. Any uncertain
+append/sync or post-sync application failure blocks writes until startup recovery. Checkpoint
+publication uses a verified immutable Flat snapshot followed by a durable recovery manifest.
+The complete retained WAL reconstructs historical retry IDs; only its suffix is applied after
+loading a checkpoint. No log pruning or HNSW recovery is provided. See [WAL recovery](wal_recovery.md).
+
 ## Structured service logs
 
 The optional gRPC target owns a shared JSON Lines writer on stderr. Application handlers emit
@@ -166,7 +177,7 @@ replication or consistency.
 
 ## Known limitations
 
-- No online HNSW compaction, service deletion API, or incremental persistence.
+- No online HNSW compaction, service deletion API, or HNSW incremental recovery.
 - No writable hot reload or concurrent HNSW construction.
 - No transactional batch insertion.
 - No TLS, authentication, authorization, or rate limiting.

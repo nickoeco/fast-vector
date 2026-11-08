@@ -69,7 +69,7 @@ write itself. It is not client-observed latency. Snapshot latency includes file 
 validation, but excludes publication into the store and the completion log write.
 
 The application handlers (`AddVector`, `BatchAdd`, `Search`, `GetStats`, `PrepareSnapshot`,
-`ActivateSnapshot`) contribute
+`ActivateSnapshot`, `Checkpoint`) contribute
 to the counters. The health service and transport failures before handler invocation do not.
 The status is the handler's return value; the client may observe another outcome after a
 network failure or deadline. Totals cover the process lifetime and are emitted once after
@@ -83,6 +83,9 @@ document chunks, external vector IDs, client metadata/authorization, peer addres
 paths, and raw exception messages. Errors use fixed status names and sanitized reason codes.
 Managed publication events contain numeric generations and validated SHA-256 content IDs;
 file chunks and raw rejected identity strings are never written to logs.
+WAL startup emits `wal_recovery_started`, `wal_recovery_completed` and `durability_config`;
+completion includes applied/checkpoint LSN, recovery time and discarded incomplete-tail bytes.
+Client operation IDs, original/normalized WAL vectors and WAL directory paths are not logged.
 Do not add arbitrary request fields or `exception.what()` to future records.
 
 One shared writer serializes complete records with a mutex and flushes each write. Control

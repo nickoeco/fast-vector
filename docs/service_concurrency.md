@@ -97,6 +97,12 @@ client retries can amplify overload. Logging is synchronous. Increasing queue ca
 reduce rejection while raising queue time and tail latency; it does not add compute workers.
 No async gRPC, priorities, adaptive pool size, tenant fairness or rate limiter is implemented.
 
+In opt-in Flat WAL mode, AddVector and Checkpoint hold the existing exclusive store lock through
+file synchronization/publication. Searches wait on the shared lock, so checkpoint duration and
+per-operation sync directly affect query tail latency. Search cancellation cannot interrupt a
+kernel filesystem sync. BatchAdd is disabled. Write availability is reported separately in
+GetStats durability state; successful read RPCs do not imply that the writer is healthy.
+
 ## Verification and reproduction
 
 Controlled tests verify limits, owned input, skipped cancelled/expired tasks, running deadlines,
