@@ -338,6 +338,70 @@ TEST(WalAllocationFailureTest, PairedCheckpointAllocationFailuresPreserveOldRoot
 TEST(WalAllocationFailureTest, RotatingCheckpointAllocationFailuresPreserveOldRootAndRetrySources) {
   verify_checkpoint_allocation_failures(true);
 }
+TEST(WalAllocationFailureTest, EpochExpiryPublicationAllocationFailuresNeverExpireOldRoot) {
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("fast-vector-epoch-allocation-" +
+                          std::to_string(reinterpret_cast<std::uintptr_t>(&allocations_left)));
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  fast_vector::WalOptions options{.directory = directory, .dimension = 3, .fault_hook = {}};
+  options.dedup_retention = true;
+  options.retained_epochs = 1;
+  const std::vector<float> values{1, 2, 3};
+  auto root_bytes = [&] {
+    std::ifstream input(directory / "recovery.manifest", std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(input), {});
+  };
+  auto descriptors = [] {
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+      (void)entry;
+      ++count;
+    }
+    return count;
+  };
+  bool completed = false;
+  std::size_t failures = 0;
+  {
+    fast_vector::DurableFlatIndex index(options);
+    (void)index.commit("one", 1, values, nullptr, 1);
+    (void)index.commit("two", 2, values, nullptr, 1);
+    const auto before = root_bytes();
+    const auto before_fds = descriptors();
+    for (std::ptrdiff_t point = 0; point < 512; ++point) {
+      bool rejected = false;
+      try {
+        const FailAllocationsAfter failure(point);
+        (void)index.checkpoint();
+      } catch (const std::exception&) {
+        rejected = true;
+      }
+      if (!rejected) {
+        completed = true;
+        break;
+      }
+      ++failures;
+      EXPECT_EQ(root_bytes(), before);
+      EXPECT_EQ(descriptors(), before_fds);
+      EXPECT_EQ(index.durability_stats().current_epoch, 1);
+      EXPECT_FALSE(index.durability_stats().recovery_required);
+      EXPECT_TRUE(index.commit("one", 1, values, nullptr, 1).replayed);
+      EXPECT_TRUE(index.commit("two", 2, values, nullptr, 1).replayed);
+    }
+  }
+  EXPECT_TRUE(completed);
+  EXPECT_GT(failures, 0);
+  {
+    fast_vector::DurableFlatIndex recovered(options);
+    EXPECT_EQ(recovered.size(), 2);
+    EXPECT_EQ(recovered.durability_stats().current_epoch, 2);
+    EXPECT_EQ(recovered.durability_stats().dedup_entries, 0);
+    EXPECT_THROW((void)recovered.commit("one", 1, values, nullptr, 1),
+                 fast_vector::DedupEpochError);
+    EXPECT_EQ(recovered.commit("three", 3, values, nullptr, 2).lsn, 3);
+  }
+  std::filesystem::remove_all(directory);
+  std::cout << "Verified expiry checkpoint allocation failure points: " << failures << '\n';
+}
 #endif
 
 }  // namespace

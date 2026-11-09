@@ -44,12 +44,19 @@ struct WalOptions {
   std::shared_ptr<MemoryBudget> loading_budget{};
   bool rotate_on_checkpoint = false;
   std::uint64_t maximum_checkpoint_bytes = 2ULL * 1024 * 1024 * 1024;
+  bool dedup_retention = false;
+  std::uint64_t retained_epochs = 3;
+  std::uint64_t maximum_epoch_operations = 100'000;
+  std::uint64_t maximum_epoch_bytes = 256ULL * 1024 * 1024;
 };
 
 struct CommitResult {
   std::uint64_t lsn = 0;
   std::size_t index_size = 0;
   bool replayed = false;
+};
+struct CheckpointResult {
+  std::uint64_t lsn = 0, current_epoch = 0, oldest_epoch = 0;
 };
 
 struct DurabilityStats {
@@ -71,6 +78,14 @@ struct DurabilityStats {
   std::uint64_t active_wal_bytes = 0;
   std::uint64_t cleaned_files = 0;
   bool cleanup_pending = false;
+  std::uint64_t current_epoch = 0, oldest_epoch = 0, retained_epochs = 0;
+  std::uint64_t current_epoch_operations = 0, current_epoch_bytes = 0;
+  std::uint64_t maximum_epoch_operations = 0, maximum_epoch_bytes = 0;
+};
+
+class DedupEpochError : public std::logic_error {
+ public:
+  explicit DedupEpochError(const char* message) : std::logic_error(message) {}
 };
 
 class RecoveryRequiredError : public std::runtime_error {
@@ -95,10 +110,12 @@ class DurableFlatIndex final : public VectorIndex {
 
   /** Reject an insertion without an operation ID; no volatile bypass exists. */
   void add(VectorId id, std::span<const float> vector) override;
+  /** Epoch zero is legacy. Bounded mode requires the advertised epoch for new operations. */
   [[nodiscard]] CommitResult commit(const std::string& operation_id, VectorId id,
                                     std::span<const float> vector,
-                                    const ResourceLimits* admission = nullptr);
-  /** Pause writes through the caller's lock and publish a verified recovery point. */
+                                    const ResourceLimits* admission = nullptr,
+                                    std::uint64_t epoch = 0);
+  /** Publish a recovery point; bounded mode also closes the current epoch, even if empty. */
   [[nodiscard]] std::uint64_t checkpoint();
   [[nodiscard]] DurabilityStats durability_stats() const noexcept;
   [[nodiscard]] std::size_t size() const noexcept override;

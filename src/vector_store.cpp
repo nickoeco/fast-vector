@@ -93,27 +93,35 @@ void VectorStore::add(const VectorId id, const std::span<const float> vector) {
 }
 
 CommitResult VectorStore::add(const VectorId id, const std::span<const float> vector,
-                              const std::string& operation_id) {
+                              const std::string& operation_id, std::uint64_t epoch) {
   if (read_only_) throw ReadOnlyStoreError();
   std::unique_lock lock(mutex_);
   if (auto* durable = dynamic_cast<DurableFlatIndex*>(writable_index_.get())) {
-    auto result = durable->commit(operation_id, id, vector, &limits_);
+    auto result = durable->commit(operation_id, id, vector, &limits_, epoch);
     if (!result.replayed) inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
     return result;
   }
-  if (!operation_id.empty()) throw std::invalid_argument("client operation IDs require WAL mode");
+  if (!operation_id.empty() || epoch)
+    throw std::invalid_argument("client operation IDs and epochs require WAL mode");
   check_growth(1);
   writable_index_->add(id, vector);
   inserted_vectors_.fetch_add(1, std::memory_order_relaxed);
   return {0, writable_index_->size(), false};
 }
 
-std::uint64_t VectorStore::checkpoint() {
+std::uint64_t VectorStore::checkpoint(std::uint64_t expected_epoch) {
+  return checkpoint_result(expected_epoch).lsn;
+}
+CheckpointResult VectorStore::checkpoint_result(std::uint64_t expected_epoch) {
   if (read_only_) throw ReadOnlyStoreError();
   std::unique_lock lock(mutex_);
   auto* durable = dynamic_cast<DurableFlatIndex*>(writable_index_.get());
   if (!durable) throw DurabilityModeError("checkpoint requires WAL mode");
-  return durable->checkpoint();
+  if (durable->durability_stats().current_epoch != expected_epoch)
+    throw DedupEpochError("checkpoint epoch mismatch");
+  const auto lsn = durable->checkpoint();
+  const auto stats = durable->durability_stats();
+  return {lsn, stats.current_epoch, stats.oldest_epoch};
 }
 
 DurabilityStats VectorStore::durability_stats() const {

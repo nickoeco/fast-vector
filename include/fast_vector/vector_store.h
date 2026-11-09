@@ -82,8 +82,10 @@ class VectorStore {
   void add(VectorId id, std::span<const float> vector);
   /** Durable mode requires a stable client operation ID; volatile mode rejects one. */
   [[nodiscard]] CommitResult add(VectorId id, std::span<const float> vector,
-                                 const std::string& operation_id);
-  [[nodiscard]] std::uint64_t checkpoint();
+                                 const std::string& operation_id, std::uint64_t epoch = 0);
+  [[nodiscard]] std::uint64_t checkpoint(std::uint64_t expected_epoch = 0);
+  /** Return the checkpoint LSN and its epoch window under one exclusive lock. */
+  [[nodiscard]] CheckpointResult checkpoint_result(std::uint64_t expected_epoch = 0);
   [[nodiscard]] DurabilityStats durability_stats() const;
 
   /**

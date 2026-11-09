@@ -57,6 +57,7 @@ constexpr std::size_t kHeader = 40;
 constexpr std::size_t kManifest = 72;
 constexpr std::size_t kManifestV2 = 88;
 constexpr std::size_t kManifestV3 = 168;
+constexpr std::size_t kManifestV4 = 208;
 constexpr std::size_t kSegmentHeader = 72;
 constexpr std::size_t kDedupHeader = 56;
 constexpr std::array<unsigned char, 8> kDedupMagic{'F', 'V', 'D', 'E', 'D', 'U', 'P', 0};
@@ -202,6 +203,7 @@ struct WalRecord {
   std::string operation_id;
   std::vector<float> original;
   std::vector<float> normalized;
+  std::uint64_t epoch = 0;
 };
 struct DedupEntry {
   std::uint64_t lsn;
@@ -211,6 +213,49 @@ struct DedupEntry {
   bool checkpoint = false;
 };
 using DedupTable = std::unordered_map<std::string, DedupEntry>;
+struct EpochPolicy {
+  std::uint64_t current = 0, oldest = 0, retained = 0, operations = 0, bytes = 0;
+};
+std::string operation_key(std::uint64_t epoch, std::string_view id) {
+  std::string key(8, '\0');
+  for (std::size_t i = 0; i < 8; ++i) {
+    key[i] = static_cast<char>(epoch & 255U);
+    epoch >>= 8;
+  }
+  key.append(id);
+  return key;
+}
+std::uint64_t key_epoch(const std::string& key) {
+  return get(std::span(reinterpret_cast<const unsigned char*>(key.data()), key.size()), 0);
+}
+std::uint64_t entry_bytes(const std::string& key, std::size_t dimension) {
+  return resource_add(80 + key.size(), resource_multiply(dimension, 4));
+}
+void validate_policy(const EpochPolicy& policy) {
+  if (policy.current == 0 || policy.retained == 0 || policy.retained > 64 ||
+      policy.operations == 0 || policy.bytes == 0 ||
+      policy.oldest !=
+          (policy.current >= policy.retained ? policy.current - policy.retained + 1 : 0))
+    invalid("dedup epoch policy");
+  (void)resource_multiply(policy.retained, policy.operations);
+  (void)resource_multiply(policy.retained, policy.bytes);
+}
+void validate_retained_table(const DedupTable& table, const EpochPolicy& policy,
+                             std::size_t dimension, bool pruning = false) {
+  if (!policy.current) return;
+  validate_policy(policy);
+  std::array<std::uint64_t, 64> counts{}, bytes{};
+  for (const auto& [key, entry] : table) {
+    (void)entry;
+    const auto epoch = key_epoch(key);
+    if (pruning && epoch < policy.oldest) continue;
+    if (epoch < policy.oldest || epoch > policy.current)
+      invalid("dedup entry epoch outside window");
+    const auto slot = epoch % 64;
+    bytes[slot] = resource_add(bytes[slot], entry_bytes(key, dimension));
+    if (++counts[slot] > policy.operations || bytes[slot] > policy.bytes) throw ResourceExhausted();
+  }
+}
 std::array<unsigned char, 32> request_digest(std::span<const unsigned char> bytes) {
   std::array<unsigned char, 32> result{};
   unsigned size = 0;
@@ -234,15 +279,17 @@ Bytes read_request(const DedupEntry& entry, int wal_fd, int checkpoint_fd, std::
   return bytes;
 }
 Bytes encode(const WalRecord& record) {
+  const auto key =
+      record.epoch ? operation_key(record.epoch, record.operation_id) : record.operation_id;
   Bytes bytes;
-  bytes.reserve(48 + record.operation_id.size() + record.original.size() * 8);
-  put(bytes, 48 + record.operation_id.size() + record.original.size() * 8);
+  bytes.reserve(48 + key.size() + record.original.size() * 8);
+  put(bytes, 48 + key.size() + record.original.size() * 8);
   put(bytes, record.lsn);
-  put(bytes, 1, 4);
-  put(bytes, record.operation_id.size(), 4);
+  put(bytes, record.epoch ? 2 : 1, 4);
+  put(bytes, key.size(), 4);
   put(bytes, record.id);
   put(bytes, record.original.size());
-  bytes.insert(bytes.end(), record.operation_id.begin(), record.operation_id.end());
+  bytes.insert(bytes.end(), key.begin(), key.end());
   for (const auto& values : {std::span(record.original), std::span(record.normalized)})
     for (float value : values) put(bytes, std::bit_cast<std::uint32_t>(value), 4);
   checksum(bytes);
@@ -252,7 +299,12 @@ Bytes encode(const WalRecord& record) {
 /** Validates fixed fields before allocating a record-sized buffer. */
 class WalReader {
  public:
-  WalReader(int fd, std::size_t dimension) : fd_(fd), dimension_(dimension), size_(file_size(fd)) {}
+  WalReader(int fd, std::size_t dimension, std::uint64_t epoch = 0)
+      : fd_(fd),
+        dimension_(dimension),
+        size_(file_size(fd)),
+        epochs_(epoch != 0),
+        expected_epoch_(epoch) {}
   bool next(WalRecord& record) {
     if (offset == size_) return false;
     const auto remaining = size_ - offset;
@@ -260,23 +312,26 @@ class WalReader {
       tail = remaining;
       return false;
     }
-    std::array<unsigned char, 40> prefix{};
+    std::array<unsigned char, 48> prefix{};
     read_all(fd_, std::span(prefix).first(std::min<std::uint64_t>(remaining, prefix.size())),
              offset);
     const auto length = get(prefix, 0);
-    const auto minimum = 49 + dimension_ * 8;
-    const auto maximum = 48 + kMaximumOperationId + dimension_ * 8;
+    const auto minimum = 49 + (epochs_ ? 8 : 0) + dimension_ * 8;
+    const auto maximum = 48 + kMaximumOperationId + (epochs_ ? 8 : 0) + dimension_ * 8;
     if (length < minimum || length > maximum) invalid("record length outside configured bounds");
     // Validate every available fixed field even when the trailing payload is incomplete.
     if (remaining >= 16 && get(prefix, 8) != next_lsn) invalid("non-contiguous LSN");
-    if (remaining >= 20 && get(prefix, 16, 4) != 1) invalid("unsupported operation");
+    if (remaining >= 20 && get(prefix, 16, 4) != (epochs_ ? 2 : 1))
+      invalid("unsupported operation");
     if (remaining >= 24) {
       const auto op_length = get(prefix, 20, 4);
-      if (op_length == 0 || op_length > kMaximumOperationId ||
+      if (op_length < (epochs_ ? 9U : 1U) || op_length > kMaximumOperationId + (epochs_ ? 8 : 0) ||
           length != 48 + op_length + dimension_ * 8)
         invalid("invalid operation ID or record length");
     }
     if (remaining >= 40 && get(prefix, 32) != dimension_) invalid("dimension mismatch");
+    if (epochs_ && remaining >= 48 && get(prefix, 40) != expected_epoch_)
+      invalid("WAL epoch mismatch");
     if (length > remaining) {
       tail = remaining;
       return false;
@@ -287,7 +342,10 @@ class WalReader {
     record.lsn = get(bytes, 8);
     record.id = get(bytes, 24);
     const auto op_length = static_cast<std::size_t>(get(bytes, 20, 4));
-    record.operation_id.assign(reinterpret_cast<const char*>(bytes.data() + 40), op_length);
+    record.epoch = epochs_ ? get(bytes, 40) : 0;
+    if (epochs_ && record.epoch == 0) invalid("zero epoch WAL record");
+    record.operation_id.assign(reinterpret_cast<const char*>(bytes.data() + 40 + (epochs_ ? 8 : 0)),
+                               op_length - (epochs_ ? 8 : 0));
     record.original.resize(dimension_);
     record.normalized.resize(dimension_);
     auto cursor = 40 + op_length;
@@ -314,6 +372,8 @@ class WalReader {
   int fd_;
   std::size_t dimension_;
   std::uint64_t size_;
+  bool epochs_;
+  std::uint64_t expected_epoch_;
 };
 
 class WalWriter {
@@ -358,6 +418,7 @@ struct RecoveryPoint {
   std::uint64_t dedup_size = 0, dedup_digest = 0;
   std::uint64_t generation = 0, active_header_digest = 0;
   std::string active_name{};
+  EpochPolicy policy{};
 };
 std::filesystem::path checkpoint_path(const WalOptions& options, std::uint64_t lsn) {
   return options.directory / ("checkpoint-" + std::to_string(lsn) + ".fv");
@@ -375,12 +436,12 @@ std::uint64_t segment_nonce(const std::string& name) {
   return value;
 }
 Bytes segment_header(const WalOptions& options, std::uint64_t generation, std::uint64_t lsn,
-                     const std::string& name) {
+                     const std::string& name, bool epochs) {
   Bytes bytes(kWalMagic.begin(), kWalMagic.end());
-  put(bytes, 2, 4);
+  put(bytes, epochs ? 3 : 2, 4);
   put(bytes, kSegmentHeader, 4);
   put(bytes, options.dimension);
-  put(bytes, 48 + kMaximumOperationId + options.dimension * 8);
+  put(bytes, 48 + kMaximumOperationId + (epochs ? 8 : 0) + options.dimension * 8);
   put(bytes, resource_add(lsn, 1));
   put(bytes, generation);
   put(bytes, lsn);
@@ -389,14 +450,14 @@ Bytes segment_header(const WalOptions& options, std::uint64_t generation, std::u
   return bytes;
 }
 std::unique_ptr<WalWriter> create_segment(const WalOptions& options, std::uint64_t generation,
-                                          std::uint64_t lsn) {
+                                          std::uint64_t lsn, bool epochs) {
   auto pattern = (options.directory / ("wal-" + std::to_string(generation) + "-XXXXXX")).string();
   std::vector<char> name(pattern.begin(), pattern.end());
   name.push_back(0);
   File file(mkstemp(name.data()));
   // Orphans are left for reference-based cleanup after a durable publication.
   const auto basename = std::filesystem::path(name.data()).filename().string();
-  const auto bytes = segment_header(options, generation, lsn, basename);
+  const auto bytes = segment_header(options, generation, lsn, basename, epochs);
   write_all(file.fd(), bytes);
   sync(file.fd());
   sync_directory(options.directory);
@@ -420,7 +481,9 @@ class DedupCheckpoint {
     const auto path = dedup_path(options, point.lsn, point.generation);
     File source(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     auto file = std::make_unique<File>(std::move(source));
-    if (point.dedup_size < kDedupHeader ||
+    const bool epochs = point.policy.current != 0;
+    const std::size_t header_size = epochs ? 64 : kDedupHeader;
+    if (point.dedup_size < header_size ||
         point.dedup_size >
             (point.generation
                  ? options.maximum_checkpoint_bytes
@@ -428,23 +491,29 @@ class DedupCheckpoint {
                                            resource_multiply(options.maximum_wal_bytes, 2))) ||
         file_size(file->fd()) != point.dedup_size || file_hash(path) != point.dedup_digest)
       invalid("dedup file size or checksum");
-    std::array<unsigned char, kDedupHeader> header{};
+    Bytes header(header_size);
     read_all(file->fd(), header, 0);
     verify_checksum(header);
     if (!std::equal(kDedupMagic.begin(), kDedupMagic.end(), header.begin()) ||
-        get(header, 8, 4) != 1 || get(header, 12, 4) != kDedupHeader ||
-        get(header, 16) != options.dimension || get(header, 24) != point.lsn ||
+        get(header, 8, 4) != (epochs ? 2 : 1) || get(header, 12, 4) != header_size ||
+        get(header, 16) != options.dimension || (!epochs && get(header, 24) != point.lsn) ||
         get(header, 32) != point.wal_offset || get(header, 40) != point.wal_digest)
       invalid("dedup header or checkpoint boundary");
-    std::uint64_t offset = kDedupHeader;
+    const auto count = get(header, 24);
+    if (count > point.lsn || (epochs && get(header, 48) != point.lsn) ||
+        (epochs && count > resource_multiply(point.policy.retained, point.policy.operations)))
+      invalid("dedup count");
+    std::uint64_t offset = header_size, previous_lsn = 0;
     std::unordered_set<VectorId> ids;
-    for (std::uint64_t lsn = 1; lsn <= point.lsn; ++lsn) {
+    for (std::uint64_t row = 0; row < count; ++row) {
       if (offset > point.dedup_size || point.dedup_size - offset < 72)
         invalid("dedup record truncated");
       std::array<unsigned char, 72> fixed{};
       read_all(file->fd(), fixed, offset);
       const auto length = get(fixed, 0), key_size = get(fixed, 24, 4);
-      if (key_size == 0 || key_size > kMaximumOperationId || get(fixed, 8) != lsn ||
+      const auto lsn = get(fixed, 8);
+      if (key_size < (epochs ? 9U : 1U) || key_size > kMaximumOperationId + (epochs ? 8 : 0) ||
+          (epochs ? (lsn <= previous_lsn || lsn > point.lsn) : lsn != row + 1) ||
           get(fixed, 28, 4) != 0 || get(fixed, 32) != options.dimension ||
           length != 80 + key_size + options.dimension * 4 || length > point.dedup_size - offset)
         invalid("dedup record fields");
@@ -453,6 +522,7 @@ class DedupCheckpoint {
       verify_checksum(bytes);
       std::string key(reinterpret_cast<const char*>(bytes.data() + 72),
                       static_cast<std::size_t>(key_size));
+      if (!epochs) key = operation_key(0, key);
       DedupEntry entry{lsn, get(bytes, 16), offset + 72 + key_size, {}, true};
       std::copy_n(bytes.begin() + 40, 32, entry.digest.begin());
       const auto raw =
@@ -468,32 +538,43 @@ class DedupCheckpoint {
       }
       if (norm == 0) invalid("dedup zero input");
       offset += length;
+      previous_lsn = lsn;
     }
     if (offset != point.dedup_size) invalid("dedup trailing data");
+    validate_retained_table(table, point.policy, options.dimension);
     return file;
   }
   static void save(const WalOptions& options, std::uint64_t lsn, WalWriter& writer,
                    const DedupTable& table, int old_checkpoint_fd,
-                   const std::filesystem::path& path) {
+                   const std::filesystem::path& path, EpochPolicy policy) {
     File output(::open(path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC));
     Bytes header(kDedupMagic.begin(), kDedupMagic.end());
-    put(header, 1, 4);
-    put(header, kDedupHeader, 4);
+    const bool epochs = policy.current != 0;
+    put(header, epochs ? 2 : 1, 4);
+    put(header, epochs ? 64 : kDedupHeader, 4);
     put(header, options.dimension);
-    put(header, lsn);
+    std::uint64_t count = 0;
+    for (const auto& [key, entry] : table) {
+      (void)entry;
+      if (!epochs || key_epoch(key) >= policy.oldest) ++count;
+    }
+    put(header, count);
     put(header, writer.offset);
     put(header, writer.digest);
+    if (epochs) put(header, lsn);
     checksum(header);
     write_all(output.fd(), header);
     std::vector<const DedupTable::value_type*> ordered;
     ordered.reserve(table.size());
-    for (const auto& entry : table) ordered.push_back(&entry);
+    for (const auto& entry : table)
+      if (!epochs || key_epoch(entry.first) >= policy.oldest) ordered.push_back(&entry);
     std::sort(ordered.begin(), ordered.end(),
               [](const auto* a, const auto* b) { return a->second.lsn < b->second.lsn; });
     std::uint64_t expected = 1;
     for (const auto* item : ordered) {
-      const auto& [key, entry] = *item;
-      if (entry.lsn != expected++) invalid("dedup LSN sequence");
+      const auto& [internal_key, entry] = *item;
+      const auto key = std::string_view(internal_key).substr(epochs ? 0 : 8);
+      if (!epochs && entry.lsn != expected++) invalid("dedup LSN sequence");
       auto raw = read_request(entry, writer.file.fd(), old_checkpoint_fd, options.dimension);
       Bytes bytes;
       bytes.reserve(80 + key.size() + raw.size());
@@ -509,7 +590,7 @@ class DedupCheckpoint {
       checksum(bytes);
       write_all(output.fd(), bytes);
     }
-    if (expected - 1 != lsn) invalid("dedup count mismatch");
+    if (!epochs && expected - 1 != lsn) invalid("dedup count mismatch");
     sync(output.fd());
   }
 };
@@ -521,13 +602,14 @@ class RecoveryManager {
     if (!std::filesystem::exists(path)) return {};
     File file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     const auto size = file_size(file.fd());
-    if (size != kManifest && size != kManifestV2 && size != kManifestV3)
+    if (size != kManifest && size != kManifestV2 && size != kManifestV3 && size != kManifestV4)
       invalid("recovery manifest length");
     Bytes bytes(static_cast<std::size_t>(size));
     read_all(file.fd(), bytes, 0);
     verify_checksum(bytes);
     if (!std::equal(kCheckpointMagic.begin(), kCheckpointMagic.end(), bytes.begin()) ||
-        get(bytes, 8, 4) != (size == kManifest ? 1 : (size == kManifestV2 ? 2 : 3)) ||
+        get(bytes, 8, 4) !=
+            (size == kManifest ? 1 : (size == kManifestV2 ? 2 : (size == kManifestV3 ? 3 : 4))) ||
         get(bytes, 12, 4) != size || get(bytes, 16) != options.dimension)
       invalid("recovery manifest configuration");
     RecoveryPoint point{get(bytes, 24), get(bytes, 32), get(bytes, 40),
@@ -537,7 +619,7 @@ class RecoveryManager {
       point.dedup_digest = get(bytes, 72);
       if (point.dedup_size < kDedupHeader) invalid("missing v2 dedup checkpoint");
     }
-    if (size == kManifestV3) {
+    if (size >= kManifestV3) {
       point.generation = get(bytes, 80);
       point.active_header_digest = get(bytes, 88);
       const auto first = bytes.begin() + 96, last = bytes.begin() + 160;
@@ -547,6 +629,11 @@ class RecoveryManager {
       point.active_name.assign(first, zero);
       if (point.generation == 0 || !valid_segment_name(point.active_name, point.generation))
         invalid("segment identity");
+    }
+    if (size == kManifestV4) {
+      point.policy = {get(bytes, 160), get(bytes, 168), get(bytes, 176), get(bytes, 184),
+                      get(bytes, 192)};
+      validate_policy(point.policy);
     }
     if (point.wal_offset < kHeader ||
         (!point.generation && point.wal_offset > options.maximum_wal_bytes) ||
@@ -583,22 +670,26 @@ class CheckpointManager {
                       WalWriter& writer, bool& manifest_renamed, const DedupTable& table,
                       int old_checkpoint_fd, DedupTable& next, std::unique_ptr<File>& next_file,
                       std::uint64_t& next_size, std::unique_ptr<WalWriter>& next_writer,
-                      RecoveryPoint& next_point) {
-    const bool rotate = options.rotate_on_checkpoint || writer.generation != 0;
+                      RecoveryPoint& next_point, EpochPolicy policy) {
+    const bool epochs = policy.current != 0;
+    const bool rotate = epochs || options.rotate_on_checkpoint || writer.generation != 0;
+    if (epochs) validate_retained_table(table, policy, options.dimension, true);
     if (rotate) {
       // Bound paired checkpoint output before writing either file.
       const auto vector_bytes =
           resource_multiply(lsn, resource_add(8, resource_multiply(options.dimension, 4)));
-      std::uint64_t dedup_bytes = kDedupHeader;
+      std::uint64_t dedup_bytes = epochs ? 64 : kDedupHeader;
       for (const auto& [key, entry] : table) {
         (void)entry;
-        dedup_bytes = resource_add(
-            dedup_bytes, resource_add(80 + key.size(), resource_multiply(options.dimension, 4)));
+        if (epochs && key_epoch(key) < policy.oldest) continue;
+        dedup_bytes =
+            resource_add(dedup_bytes, resource_add(80 + key.size() - (epochs ? 0 : 8),
+                                                   resource_multiply(options.dimension, 4)));
       }
       if (resource_add(resource_add(56, vector_bytes), dedup_bytes) >
           options.maximum_checkpoint_bytes)
         throw ResourceExhausted();
-      next_writer = create_segment(options, resource_add(writer.generation, 1), lsn);
+      next_writer = create_segment(options, resource_add(writer.generation, 1), lsn, epochs);
       writer.hit(WalBoundary::AfterWalCreated);
     }
     const auto generation = next_writer ? next_writer->generation : 0;
@@ -623,7 +714,7 @@ class CheckpointManager {
     }
     sync_directory(options.directory);
     Temporary dedup(options.directory);
-    DedupCheckpoint::save(options, lsn, writer, table, old_checkpoint_fd, dedup.path());
+    DedupCheckpoint::save(options, lsn, writer, table, old_checkpoint_fd, dedup.path(), policy);
     const auto dedup_size = std::filesystem::file_size(dedup.path());
     const auto dedup_digest = file_hash(dedup.path());
     const auto dedup_destination = dedup_path(options, lsn, generation);
@@ -636,6 +727,7 @@ class CheckpointManager {
     RecoveryPoint point{lsn,           size, digest,     writer.offset,
                         writer.digest, true, dedup_size, dedup_digest};
     point.generation = generation;
+    point.policy = policy;
     if (next_writer) {
       point.active_name = next_writer->name;
       point.active_header_digest = next_writer->digest;
@@ -644,8 +736,8 @@ class CheckpointManager {
     next_size = dedup_size;
     sync_directory(options.directory);
     Bytes bytes(kCheckpointMagic.begin(), kCheckpointMagic.end());
-    put(bytes, rotate ? 3 : 2, 4);
-    put(bytes, rotate ? kManifestV3 : kManifestV2, 4);
+    put(bytes, epochs ? 4 : (rotate ? 3 : 2), 4);
+    put(bytes, epochs ? kManifestV4 : (rotate ? kManifestV3 : kManifestV2), 4);
     put(bytes, options.dimension);
     put(bytes, lsn);
     put(bytes, size);
@@ -659,6 +751,13 @@ class CheckpointManager {
       put(bytes, point.active_header_digest);
       bytes.insert(bytes.end(), point.active_name.begin(), point.active_name.end());
       bytes.resize(160, 0);
+    }
+    if (epochs) {
+      put(bytes, policy.current);
+      put(bytes, policy.oldest);
+      put(bytes, policy.retained);
+      put(bytes, policy.operations);
+      put(bytes, policy.bytes);
     }
     checksum(bytes);
     next_point = std::move(point);
@@ -687,6 +786,16 @@ class DurableFlatIndex::Impl {
     sync_directory(options.directory);
     sync_directory(options.directory.has_parent_path() ? options.directory.parent_path() : ".");
     auto point = RecoveryManager::checkpoint(options, index);
+    if (point.policy.current) {
+      if (options.dedup_retention && (options.retained_epochs != point.policy.retained ||
+                                      options.maximum_epoch_operations != point.policy.operations ||
+                                      options.maximum_epoch_bytes != point.policy.bytes))
+        throw std::invalid_argument("persisted dedup policy differs from requested policy");
+      options.dedup_retention = true;
+      options.retained_epochs = point.policy.retained;
+      options.maximum_epoch_operations = point.policy.operations;
+      options.maximum_epoch_bytes = point.policy.bytes;
+    }
     if (point.generation) verify_private_directory(options.directory);
     if (!point.present) {
       // Never bootstrap an empty/obsolete legacy WAL after losing a segmented root.
@@ -708,16 +817,17 @@ class DurableFlatIndex::Impl {
     read_all(writer->file.fd(), header, 0);
     verify_checksum(header);
     if (!std::equal(kWalMagic.begin(), kWalMagic.end(), header.begin()) ||
-        get(header, 8, 4) != (point.generation ? 2 : 1) || get(header, 12, 4) != header.size() ||
-        get(header, 16) != options.dimension ||
-        get(header, 24) != 48 + kMaximumOperationId + options.dimension * 8)
+        get(header, 8, 4) != (point.policy.current ? 3 : (point.generation ? 2 : 1)) ||
+        get(header, 12, 4) != header.size() || get(header, 16) != options.dimension ||
+        get(header, 24) !=
+            48 + kMaximumOperationId + (point.policy.current ? 8 : 0) + options.dimension * 8)
       invalid("WAL header configuration");
     if (point.generation &&
         (get(header, 32) != resource_add(point.lsn, 1) || get(header, 40) != point.generation ||
          get(header, 48) != point.lsn || get(header, 56) != segment_nonce(point.active_name) ||
          hash(header) != point.active_header_digest))
       invalid("WAL identity or start LSN");
-    WalReader reader(writer->file.fd(), options.dimension);
+    WalReader reader(writer->file.fd(), options.dimension, point.policy.current);
     reader.digest = hash(header);
     bool found_checkpoint = point.lsn == 0 && point.wal_offset == kHeader &&
                             (!point.present || point.wal_digest == reader.digest);
@@ -738,7 +848,14 @@ class DurableFlatIndex::Impl {
       key_bytes += key.size();
     }
     const auto scan_start = reader.offset;
+    current_point = point;
+    refresh_usage();
     while (reader.next(record)) {
+      const auto key = operation_key(record.epoch, record.operation_id);
+      if (point.policy.current) {
+        if (record.epoch != point.policy.current) invalid("WAL epoch differs from active epoch");
+        check_epoch_capacity(key);
+      }
       check_wal_shape(options.limits, options.dimension, record.lsn);
       if (record.lsn <= point.lsn) {
         if (!WalIndexAccess::matches(index, record.id, record.normalized))
@@ -748,12 +865,15 @@ class DurableFlatIndex::Impl {
         ++stats.recovered_records;
       }
       if (!dedup
-               .emplace(record.operation_id,
-                        DedupEntry{record.lsn, record.id, reader.original_offset,
-                                   request_digest(original_bits(record.original)), false})
+               .emplace(key, DedupEntry{record.lsn, record.id, reader.original_offset,
+                                        request_digest(original_bits(record.original)), false})
                .second)
         invalid("duplicate operation ID in WAL");
-      key_bytes += record.operation_id.size();
+      key_bytes += key.size();
+      if (point.policy.current) {
+        ++stats.current_epoch_operations;
+        stats.current_epoch_bytes += entry_bytes(key, options.dimension);
+      }
       if (!seen_ids.insert(record.id).second) invalid("duplicate vector ID in WAL");
       if (record.lsn == point.lsn) {
         if (reader.offset != point.wal_offset || reader.digest != point.wal_digest)
@@ -780,8 +900,10 @@ class DurableFlatIndex::Impl {
     stats.wal_scan_bytes = reader.offset - scan_start;
     stats.dedup_file_bytes = point.dedup_size;
     current_point = std::move(point);
+    refresh_usage();
     stats.wal_generation = writer->generation;
     if (writer->generation) cleanup();
+    if (options.dedup_retention && !current_point.policy.current) (void)checkpoint(false);
     stats.recovery_us = elapsed(start);
   }
   static int open_lock(const WalOptions& options) {
@@ -790,11 +912,16 @@ class DurableFlatIndex::Impl {
         options.maximum_wal_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
         options.directory.empty() || !std::filesystem::is_directory(options.directory))
       throw std::invalid_argument("WAL requires an existing directory and bounded configuration");
-    if ((options.rotate_on_checkpoint && options.maximum_wal_bytes < kSegmentHeader) ||
+    if (((options.rotate_on_checkpoint || options.dedup_retention) &&
+         options.maximum_wal_bytes < kSegmentHeader) ||
         options.maximum_checkpoint_bytes == 0)
       throw std::invalid_argument("invalid rotation limits");
     check_wal_shape(options.limits, options.dimension, 0);
-    if (options.rotate_on_checkpoint) verify_private_directory(options.directory);
+    if (options.rotate_on_checkpoint || options.dedup_retention)
+      verify_private_directory(options.directory);
+    if (options.dedup_retention)
+      validate_policy({1, options.retained_epochs == 1 ? 1U : 0U, options.retained_epochs,
+                       options.maximum_epoch_operations, options.maximum_epoch_bytes});
     return ::open((options.directory / "writer.lock").c_str(),
                   O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
   }
@@ -817,13 +944,18 @@ class DurableFlatIndex::Impl {
     sync_directory(options.directory);
   }
   CommitResult commit(const std::string& operation_id, VectorId id, std::span<const float> vector,
-                      const ResourceLimits* admission) {
+                      const ResourceLimits* admission, std::uint64_t epoch) {
     if (stats.recovery_required) throw RecoveryRequiredError();
     const auto start = Clock::now();
     if (operation_id.empty() || operation_id.size() > kMaximumOperationId ||
         vector.size() != options.dimension)
       throw std::invalid_argument("operation ID or dimension invalid");
-    const auto existing = dedup.find(operation_id);
+    const auto& policy = current_point.policy;
+    if ((!policy.current && epoch != 0) || epoch > policy.current)
+      throw DedupEpochError("future or unsupported dedup epoch");
+    if (policy.current && epoch < policy.oldest) throw DedupEpochError("dedup epoch expired");
+    const auto key = operation_key(epoch, operation_id);
+    const auto existing = dedup.find(key);
     if (existing != dedup.end()) {
       const auto& old = existing->second;
       auto raw = original_bits(vector);
@@ -842,14 +974,18 @@ class DurableFlatIndex::Impl {
       if (raw != stored) throw std::invalid_argument("operation ID reused with different content");
       return {old.lsn, static_cast<std::size_t>(old.lsn), true};
     }
+    if (policy.current && epoch != policy.current)
+      throw DedupEpochError("closed dedup epoch has no matching operation");
+    check_epoch_capacity(key);
     if (WalIndexAccess::contains(index, id))
       throw std::invalid_argument("vector ID already exists");
     check_wal_shape(options.limits, options.dimension, resource_add(index.size(), 1));
     if (admission) check_wal_shape(*admission, options.dimension, resource_add(index.size(), 1));
     if (stats.applied_lsn == std::numeric_limits<std::uint64_t>::max())
       throw std::length_error("LSN exhausted");
-    WalRecord record{stats.applied_lsn + 1, id, operation_id,
-                     std::vector<float>(vector.begin(), vector.end()), normalize_l2(vector)};
+    WalRecord record{stats.applied_lsn + 1, id,
+                     operation_id,          std::vector<float>(vector.begin(), vector.end()),
+                     normalize_l2(vector),  epoch};
     auto bytes = encode(record);
     if (bytes.size() > options.maximum_wal_bytes - writer->offset) {
       if (!(options.rotate_on_checkpoint || writer->generation))
@@ -857,13 +993,17 @@ class DurableFlatIndex::Impl {
       if (options.maximum_wal_bytes < kSegmentHeader ||
           bytes.size() > options.maximum_wal_bytes - kSegmentHeader)
         throw std::length_error("record exceeds WAL segment limit");
-      (void)checkpoint();
+      (void)checkpoint(false);
     }
     // Allocate retry metadata before any append. All errors after this point fail closed.
-    dedup.emplace(operation_id,
-                  DedupEntry{record.lsn, id, writer->offset + 40 + operation_id.size(),
-                             request_digest(original_bits(record.original)), false});
-    key_bytes += operation_id.size();
+    dedup.emplace(
+        key, DedupEntry{record.lsn, id, writer->offset + 40 + operation_id.size() + (epoch ? 8 : 0),
+                        request_digest(original_bits(record.original)), false});
+    key_bytes += key.size();
+    if (policy.current) {
+      ++stats.current_epoch_operations;
+      stats.current_epoch_bytes += entry_bytes(key, options.dimension);
+    }
     try {
       writer->append(bytes);
       stats.last_sync_us = writer->sync_us;
@@ -879,7 +1019,7 @@ class DurableFlatIndex::Impl {
       throw;
     }
   }
-  std::uint64_t checkpoint() {
+  std::uint64_t checkpoint(bool advance = true) {
     if (stats.recovery_required) throw RecoveryRequiredError();
     const auto start = Clock::now();
     bool renamed = false;
@@ -888,10 +1028,18 @@ class DurableFlatIndex::Impl {
     std::uint64_t next_size = 0;
     std::unique_ptr<WalWriter> next_writer;
     RecoveryPoint next_point;
+    auto policy = current_point.policy;
+    if (!policy.current && options.dedup_retention)
+      policy = {1, options.retained_epochs == 1 ? 1U : 0U, options.retained_epochs,
+                options.maximum_epoch_operations, options.maximum_epoch_bytes};
+    else if (policy.current && advance) {
+      policy.current = resource_add(policy.current, 1);
+      policy.oldest = policy.current >= policy.retained ? policy.current - policy.retained + 1 : 0;
+    }
     try {
       CheckpointManager::publish(options, index, stats.applied_lsn, *writer, renamed, dedup,
                                  dedup_file ? dedup_file->fd() : -1, next, next_file, next_size,
-                                 next_writer, next_point);
+                                 next_writer, next_point, policy);
       if (next_writer) writer->hit(WalBoundary::BeforeWriterSwitch);
     } catch (...) {
       if (renamed) stats.recovery_required = true;
@@ -901,6 +1049,7 @@ class DurableFlatIndex::Impl {
     dedup_file.swap(next_file);
     if (next_writer) writer.swap(next_writer);
     current_point = std::move(next_point);
+    refresh_usage();
     stats.wal_generation = writer->generation;
     stats.dedup_file_bytes = next_size;
     stats.checkpoint_lsn = stats.applied_lsn;
@@ -915,6 +1064,32 @@ class DurableFlatIndex::Impl {
     if (writer->generation) cleanup();
     stats.last_checkpoint_us = elapsed(start);
     return stats.checkpoint_lsn;
+  }
+  void refresh_usage() noexcept {
+    const auto& policy = current_point.policy;
+    stats.current_epoch = policy.current;
+    stats.oldest_epoch = policy.oldest;
+    stats.retained_epochs = policy.retained;
+    stats.maximum_epoch_operations = policy.operations;
+    stats.maximum_epoch_bytes = policy.bytes;
+    stats.current_epoch_operations = 0;
+    stats.current_epoch_bytes = 0;
+    key_bytes = 0;
+    for (const auto& [key, entry] : dedup) {
+      (void)entry;
+      key_bytes += key.size();
+      if (policy.current && key_epoch(key) == policy.current) {
+        ++stats.current_epoch_operations;
+        stats.current_epoch_bytes += 80 + key.size() + options.dimension * 4;
+      }
+    }
+  }
+  void check_epoch_capacity(const std::string& key) const {
+    const auto& policy = current_point.policy;
+    if (policy.current && (stats.current_epoch_operations >= policy.operations ||
+                           resource_add(stats.current_epoch_bytes,
+                                        entry_bytes(key, options.dimension)) > policy.bytes))
+      throw ResourceExhausted();
   }
   void cleanup() noexcept {
     stats.cleanup_pending = true;
@@ -960,7 +1135,8 @@ class DurableFlatIndex::Impl {
   explicit Impl(WalOptions options) : index(options.dimension) {
     throw std::runtime_error("WAL durability is supported only on Linux");
   }
-  CommitResult commit(const std::string&, VectorId, std::span<const float>, const ResourceLimits*) {
+  CommitResult commit(const std::string&, VectorId, std::span<const float>, const ResourceLimits*,
+                      std::uint64_t) {
     throw RecoveryRequiredError();
   }
   std::uint64_t checkpoint() { throw RecoveryRequiredError(); }
@@ -977,8 +1153,8 @@ void DurableFlatIndex::add(VectorId, std::span<const float>) {
 }
 CommitResult DurableFlatIndex::commit(const std::string& operation_id, VectorId id,
                                       std::span<const float> vector,
-                                      const ResourceLimits* admission) {
-  return impl_->commit(operation_id, id, vector, admission);
+                                      const ResourceLimits* admission, std::uint64_t epoch) {
+  return impl_->commit(operation_id, id, vector, admission, epoch);
 }
 std::uint64_t DurableFlatIndex::checkpoint() { return impl_->checkpoint(); }
 DurabilityStats DurableFlatIndex::durability_stats() const noexcept {
