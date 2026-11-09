@@ -50,9 +50,10 @@ std::size_t number(const char* value) {
 
 int main(int argc, char* argv[]) {
   try {
-    if (argc != 4 && argc != 5)
+    if (argc != 4 && argc != 5 && argc != 6)
       throw std::invalid_argument(
-          "usage: fast_vector_wal_benchmark NEW_DIRECTORY COUNT DIMENSION [SEGMENT_BYTES]");
+          "usage: fast_vector_wal_benchmark NEW_DIRECTORY COUNT DIMENSION [SEGMENT_BYTES "
+          "[EPOCH_OPERATIONS]]");
     const std::filesystem::path directory = argv[1];
     const auto count = number(argv[2]), dimension = number(argv[3]);
     if (count < 2 || count > 1'000'000 || dimension > 1'000'000)
@@ -61,9 +62,13 @@ int main(int argc, char* argv[]) {
       throw std::invalid_argument("benchmark requires a new directory");
     fast_vector::WalOptions options{
         .directory = directory, .dimension = dimension, .fault_hook = {}};
-    if (argc == 5) {
+    if (argc >= 5) {
       options.rotate_on_checkpoint = true;
       options.maximum_wal_bytes = number(argv[4]);
+    }
+    if (argc == 6) {
+      options.dedup_retention = true;
+      options.maximum_epoch_operations = number(argv[5]);
     }
     std::mt19937 random(42);
     std::uniform_real_distribution<float> distribution(-1, 1);
@@ -71,15 +76,29 @@ int main(int argc, char* argv[]) {
     latency.reserve(count);
     sync.reserve(count);
     std::vector<float> vector(dimension);
+    std::vector<std::uint64_t> epochs(count, 0);
     double checkpoint_us = 0;
+    double quota_checkpoint_us = 0, build_us = 0;
+    std::uint64_t quota_checkpoints = 0;
     std::uint64_t before_bytes = 0, after_bytes = 0, wal_before = 0, wal_after = 0, cleaned = 0;
     {
       fast_vector::DurableFlatIndex index(options);
+      const auto build_start = Clock::now();
       for (std::size_t i = 0; i < count; ++i) {
+        auto state = index.durability_stats();
+        if (options.dedup_retention &&
+            state.current_epoch_operations >= state.maximum_epoch_operations) {
+          const auto quota_start = Clock::now();
+          (void)index.checkpoint();
+          quota_checkpoint_us += us(quota_start);
+          ++quota_checkpoints;
+          state = index.durability_stats();
+        }
+        epochs[i] = state.current_epoch;
         for (auto& value : vector) value = distribution(random);
         const auto operation = "benchmark-" + std::to_string(i);
         const auto start = Clock::now();
-        (void)index.commit(operation, i, vector);
+        (void)index.commit(operation, i, vector, nullptr, epochs[i]);
         latency.push_back(us(start));
         sync.push_back(index.durability_stats().last_sync_us);
         if (i + 1 == count / 2) {
@@ -93,11 +112,13 @@ int main(int argc, char* argv[]) {
         }
       }
       cleaned = index.durability_stats().cleaned_files;
+      build_us = us(build_start);
     }
     double recovery_us = 0, wal_only_recovery_us = 0;
     fast_vector::DurabilityStats stats;
     double retry_us = 0;
     std::uint64_t recovery_rss = 0;
+    std::uint64_t retried = 0, expired = 0;
     {
       const auto start = Clock::now();
       fast_vector::DurableFlatIndex recovered(options);
@@ -110,12 +131,24 @@ int main(int argc, char* argv[]) {
       for (std::size_t i = 0; i < count; ++i) {
         for (auto& value : vector) value = distribution(repeated);
         const auto key = "benchmark-" + std::to_string(i);
+        if (epochs[i] < stats.oldest_epoch) {
+          try {
+            (void)recovered.commit(key, i, vector, nullptr, epochs[i]);
+            throw std::runtime_error("expired retry was accepted");
+          } catch (const fast_vector::DedupEpochError&) {
+            ++expired;
+          }
+          continue;
+        }
         const auto retry_start = Clock::now();
-        const auto retry = recovered.commit(key, i, vector);
+        const auto retry = recovered.commit(key, i, vector, nullptr, epochs[i]);
         retry_us += us(retry_start);
+        ++retried;
         if (!retry.replayed) throw std::runtime_error("retry unexpectedly inserted");
       }
-      retry_us /= count;
+      retry_us /= retried;
+      if (recovered.size() != count || recovered.durability_stats().applied_lsn != count)
+        throw std::runtime_error("retry altered index");
     }
     // This is a newly created benchmark fixture, not an operational recovery directory.
     if (!options.rotate_on_checkpoint) {
@@ -178,6 +211,16 @@ int main(int argc, char* argv[]) {
               << "  \"directory_bytes_after_checkpoint\": " << after_bytes << ",\n"
               << "  \"wal_before_checkpoint_bytes\": " << wal_before << ",\n"
               << "  \"wal_after_checkpoint_bytes\": " << wal_after << ",\n"
+              << "  \"current_epoch\": " << stats.current_epoch << ",\n"
+              << "  \"oldest_epoch\": " << stats.oldest_epoch << ",\n"
+              << "  \"retained_epochs\": " << stats.retained_epochs << ",\n"
+              << "  \"epoch_operation_limit\": " << stats.maximum_epoch_operations << ",\n"
+              << "  \"dedup_entries\": " << stats.dedup_entries << ",\n"
+              << "  \"retained_retries\": " << retried << ",\n"
+              << "  \"expired_rejections\": " << expired << ",\n"
+              << "  \"quota_checkpoints\": " << quota_checkpoints << ",\n"
+              << "  \"quota_checkpoint_total_us\": " << quota_checkpoint_us << ",\n"
+              << "  \"build_pipeline_us\": " << build_us << ",\n"
               << "  \"wal_bytes\": " << wal_bytes << "\n}\n";
     return 0;
   } catch (const std::exception& error) {
