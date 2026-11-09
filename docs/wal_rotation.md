@@ -1,7 +1,9 @@
 # Checkpoint-bound WAL rotation
 
 This stage adds segmented WAL publication and reference-based cleanup to disk-backed
-deduplication. All historical operation IDs remain valid. There is no epoch/expiry policy,
+deduplication. Without [finite retention](dedup_retention.md), all historical operation IDs remain valid.
+The optional retention stage adds recovery version 4 and epoch-aware segments/checkpoints.
+This document describes version-3 rotation. There is no
 group commit, HNSW recovery or background checkpoint worker.
 
 ## Enable and migrate
@@ -149,7 +151,7 @@ Paths, original vectors and operation IDs remain excluded from logs.
 
 Checkpoint/rotation is synchronous: index/dedup validation, fsync and cleanup can increase write
 and query tail latency. Historical dedup checkpoint and metadata size still grow with operations;
-epoch retention is the next stage. There is no cluster replication, background compaction or
+finite retention must be enabled separately. There is no cluster replication, background compaction or
 power-loss test. SIGKILL tests leave kernel/device caches alive.
 
 The benchmark accepts optional segment bytes:

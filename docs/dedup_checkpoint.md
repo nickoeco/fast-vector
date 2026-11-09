@@ -4,6 +4,8 @@ This is the first stage of the approved deduplication retention design. It prese
 historical retry semantics. It does not implement epochs, expiry, WAL rotation or file deletion.
 The next stage adds opt-in [WAL rotation](wal_rotation.md) with a version-3 recovery manifest;
 the version-2 path described below remains available when rotation is disabled.
+Optional [epoch retention](dedup_retention.md) adds version 4, sparse retained LSNs and a bounded
+retry table. This document describes the unlimited-history version-2 path.
 
 ## Ownership and exact retries
 

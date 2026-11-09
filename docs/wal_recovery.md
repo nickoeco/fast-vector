@@ -16,13 +16,14 @@ The internal components in `src/durable_flat_index.cpp` have separate responsibi
 - `CheckpointManager`: publish an immutable snapshot and then its recovery manifest.
 - `DurableFlatIndex::Impl`: validate, deduplicate, coordinate commit and fail closed.
 
-All historical operation IDs remain retained. With rotation disabled the entire WAL is retained;
+By default all historical operation IDs remain retained. Optional [dedup retention](dedup_retention.md)
+introduces persisted epoch windows and rejects expired requests. With rotation disabled the entire WAL is retained;
 opt-in [WAL rotation](wal_rotation.md) adds a version-3 recovery root and safe artifact cleanup.
 New version 2 recovery
 manifests reference a paired deduplication checkpoint, restoring retry metadata without scanning
 the old WAL prefix. Version 1 recovery still scans the full log. Raw requests are disk-backed;
 see [deduplication checkpoints](dedup_checkpoint.md) for the current format and publication rules.
-There is no operation expiry, group commit, durable deletion, transactional batch insertion, HNSW recovery,
+There is no group commit, durable deletion, transactional batch insertion, HNSW recovery,
 writable replication, writable snapshot reload or automatic repair of corrupt files.
 
 ## Meaning of success

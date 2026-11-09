@@ -147,8 +147,9 @@ publication uses a verified immutable Flat snapshot followed by a durable recove
 Version 2 recovery restores retry metadata from a paired deduplication checkpoint and reads only
 the WAL suffix. Legacy manifests retain full-scan recovery. Exact request bits live on disk,
 not in the in-memory retry table. Opt-in checkpoint-bound WAL rotation publishes a new segment
-and cleans unreferenced artifacts after durable publication. Operation expiry and HNSW recovery
-are not provided. See [WAL rotation](wal_rotation.md),
+and cleans unreferenced artifacts after durable publication. Optional epoch retention persists
+a bounded retry window and rejects expired requests; index vectors remain present. HNSW recovery
+is not provided. See [dedup retention](dedup_retention.md), [WAL rotation](wal_rotation.md),
 [WAL recovery](wal_recovery.md) and [deduplication checkpoints](dedup_checkpoint.md).
 
 ## Structured service logs

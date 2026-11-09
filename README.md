@@ -374,8 +374,11 @@ Startup validates and restores the index and retry table before listening. A syn
 application failure stops writes until restart. New checkpoints also persist the deduplication
 state: memory retains metadata and disk references, while exact original request bits remain
 on disk. Version 2 recovery scans only the WAL suffix; legacy manifests still scan the full WAL.
-All historical operation IDs remain retained. Opt-in `--wal-rotation true` rotates the WAL at
-checkpoint and cleans obsolete recovery artifacts; expiry is not implemented yet. See
+Without finite retention, all historical operation IDs remain retained. Opt-in
+`--dedup-retention true` adds persisted epoch-scoped retries with count/byte quotas; explicit
+checkpoint advances the window, and expired retries are refused. See
+[dedup retention](docs/dedup_retention.md). Opt-in `--wal-rotation true` rotates the WAL at
+checkpoint and cleans obsolete recovery artifacts. See
 [WAL rotation](docs/wal_rotation.md) and [deduplication checkpoints](docs/dedup_checkpoint.md). A configured WAL
 byte limit refuses new operations rather than deleting history. See
 [WAL recovery](docs/wal_recovery.md) for the binary format, failure contract, storage assumptions,
