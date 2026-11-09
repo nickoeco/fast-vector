@@ -26,7 +26,12 @@ enum class WalBoundary {
   AfterApply,
   BeforeResponse,
   BeforeCheckpointPublish,
-  AfterCheckpointRename
+  AfterCheckpointRename,
+  AfterWalCreated,
+  BeforeWriterSwitch,
+  AfterWriterSwitch,
+  BeforeWalCleanup,
+  AfterWalCleanup
 };
 
 struct WalOptions {
@@ -37,6 +42,8 @@ struct WalOptions {
   std::function<void(WalBoundary)> fault_hook;
   ResourceLimits limits{};
   std::shared_ptr<MemoryBudget> loading_budget{};
+  bool rotate_on_checkpoint = false;
+  std::uint64_t maximum_checkpoint_bytes = 2ULL * 1024 * 1024 * 1024;
 };
 
 struct CommitResult {
@@ -56,6 +63,14 @@ struct DurabilityStats {
   std::uint64_t last_sync_us = 0;
   std::uint64_t last_write_us = 0;
   std::uint64_t last_checkpoint_us = 0;
+  std::uint64_t dedup_entries = 0;
+  std::uint64_t dedup_metadata_bytes = 0;
+  std::uint64_t dedup_file_bytes = 0;
+  std::uint64_t wal_scan_bytes = 0;
+  std::uint64_t wal_generation = 0;
+  std::uint64_t active_wal_bytes = 0;
+  std::uint64_t cleaned_files = 0;
+  bool cleanup_pending = false;
 };
 
 class RecoveryRequiredError : public std::runtime_error {

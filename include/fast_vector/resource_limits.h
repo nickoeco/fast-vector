@@ -37,7 +37,7 @@ inline void check_shape(const ResourceLimits& limits, std::uint64_t dimension,
 inline void check_wal_shape(const ResourceLimits& limits, std::uint64_t dimension,
                             std::uint64_t count) {
   check_shape(limits, dimension, count);
-  if (resource_multiply(count, resource_add(resource_multiply(dimension, 8), 768)) >
+  if (resource_multiply(count, resource_add(resource_multiply(dimension, 4), 1024)) >
       limits.maximum_index_bytes)
     throw ResourceExhausted();
 }

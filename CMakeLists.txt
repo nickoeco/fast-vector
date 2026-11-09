@@ -15,6 +15,7 @@ if(FAST_VECTOR_ENABLE_SANITIZERS AND FAST_VECTOR_ENABLE_THREAD_SANITIZER)
 endif()
 
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_library(fast_vector
     src/batch_searcher.cpp
@@ -37,7 +38,7 @@ target_include_directories(fast_vector
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(fast_vector PRIVATE Threads::Threads)
+target_link_libraries(fast_vector PRIVATE Threads::Threads OpenSSL::Crypto)
 
 if(MSVC)
     set_source_files_properties(src/distance_auto.cpp PROPERTIES COMPILE_OPTIONS /fp:fast)

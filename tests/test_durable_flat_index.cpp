@@ -191,7 +191,7 @@ TEST(DurableFlatIndexTest, RejectsCompleteCorruptionIllegalFieldsAndRepeatedLsn)
   EXPECT_THROW(DurableFlatIndex{wrong}, std::runtime_error);
 }
 
-TEST(DurableFlatIndexTest, CorruptManifestCheckpointAndCheckpointedWalAreRejected) {
+TEST(DurableFlatIndexTest, CorruptManifestCheckpointAndDedupAreRejected) {
   Directory directory;
   {
     DurableFlatIndex index(directory.options());
@@ -217,7 +217,7 @@ TEST(DurableFlatIndexTest, CorruptManifestCheckpointAndCheckpointedWalAreRejecte
   write(checkpoint, bad);
   EXPECT_THROW(DurableFlatIndex{directory.options()}, std::runtime_error);
   write(checkpoint, good_checkpoint);
-  const auto wal = directory.path / "operations.wal";
+  const auto wal = directory.path / "dedup-1.fvd";
   bad = read(wal);
   bad.back() ^= 1;
   write(wal, bad);
@@ -439,5 +439,402 @@ TEST(DurableFlatIndexTest, SigkillAtCommitBoundariesPreservesAllAcknowledgedOper
     EXPECT_EQ(pending.lsn, 2);
     EXPECT_EQ(recovered.size(), 2);
   }
+}
+TEST(DurableFlatIndexTest, V2SkipsOldWalPrefixAndRetriesFromDedupFile) {
+  Directory directory;
+  std::size_t boundary = 0;
+  {
+    DurableFlatIndex index(directory.options());
+    (void)index.commit("prefix", 1, kVector);
+    (void)index.checkpoint();
+    boundary = std::filesystem::file_size(directory.path / "operations.wal");
+    (void)index.commit("suffix", 2, kVector);
+  }
+  auto bytes = read(directory.path / "operations.wal");
+  bytes[boundary - 1] ^= 1;
+  write(directory.path / "operations.wal", bytes);
+  DurableFlatIndex index(directory.options());
+  EXPECT_EQ(index.durability_stats().wal_scan_bytes, bytes.size() - boundary);
+  EXPECT_EQ(index.durability_stats().recovered_records, 1);
+  EXPECT_TRUE(index.commit("prefix", 1, kVector).replayed);
+  EXPECT_TRUE(index.commit("suffix", 2, kVector).replayed);
+  (void)index.checkpoint();
+  EXPECT_EQ(index.durability_stats().dedup_entries, 2);
+}
+
+TEST(DurableFlatIndexTest, LegacyManifestScansWalAndUpgradesOnCheckpoint) {
+  Directory directory;
+  {
+    DurableFlatIndex index(directory.options());
+    (void)index.commit("one", 1, kVector);
+    (void)index.checkpoint();
+  }
+  auto manifest = read(directory.path / "recovery.manifest");
+  manifest.resize(72);
+  put(manifest, 8, 1, 4);
+  put(manifest, 12, 72, 4);
+  checksum(manifest);
+  write(directory.path / "recovery.manifest", manifest);
+  {
+    DurableFlatIndex index(directory.options());
+    EXPECT_EQ(index.durability_stats().wal_scan_bytes,
+              std::filesystem::file_size(directory.path / "operations.wal") - 40);
+    EXPECT_TRUE(index.commit("one", 1, kVector).replayed);
+    (void)index.checkpoint();
+  }
+  DurableFlatIndex index(directory.options());
+  EXPECT_EQ(index.durability_stats().wal_scan_bytes, 0);
+  EXPECT_TRUE(index.commit("one", 1, kVector).replayed);
+}
+
+TEST(DurableFlatIndexTest, CorruptDedupStructureIsRejectedEvenWithUpdatedChecksums) {
+  Directory directory;
+  {
+    DurableFlatIndex index(directory.options());
+    (void)index.commit("one", 1, kVector);
+    (void)index.checkpoint();
+  }
+  const auto file = directory.path / "dedup-1.fvd";
+  const auto good = read(file), root = read(directory.path / "recovery.manifest");
+  for (const auto [offset, value, width] :
+       std::vector<std::array<std::uint64_t, 3>>{{56, UINT64_MAX, 8},
+                                                 {64, 2, 8},
+                                                 {72, 999, 8},
+                                                 {80, 257, 4},
+                                                 {84, 1, 4},
+                                                 {88, 4, 8},
+                                                 {96, 0, 8}}) {
+    auto bytes = good;
+    put(bytes, offset, value, width);
+    checksum(bytes, 56);
+    write(file, bytes);
+    auto manifest = root;
+    put(manifest, 72, hash(bytes, 0, bytes.size()));
+    checksum(manifest);
+    write(directory.path / "recovery.manifest", manifest);
+    EXPECT_THROW(DurableFlatIndex{directory.options()}, std::exception);
+  }
+}
+
+TEST(DurableFlatIndexTest, MetadataDoesNotRetainDimensionSizedVectorsAndRetryRemainsBitExact) {
+  std::uint64_t small = 0;
+  for (const auto dimension : {3U, 4096U}) {
+    Directory directory;
+    auto options = directory.options();
+    options.dimension = dimension;
+    const std::vector<float> values(dimension, 1);
+    {
+      DurableFlatIndex index(options);
+      (void)index.commit("one", 1, values);
+      const auto metadata = index.durability_stats().dedup_metadata_bytes;
+      if (dimension == 3)
+        small = metadata;
+      else
+        EXPECT_EQ(metadata, small);
+      (void)index.checkpoint();
+      EXPECT_EQ(index.durability_stats().dedup_metadata_bytes, metadata);
+    }
+    DurableFlatIndex index(options);
+    EXPECT_TRUE(index.commit("one", 1, values).replayed);
+    auto changed = values;
+    changed.back() = 2;
+    EXPECT_THROW((void)index.commit("one", 1, changed), std::invalid_argument);
+    EXPECT_EQ(index.durability_stats().dedup_metadata_bytes, small);
+  }
+}
+
+TEST(DurableFlatIndexTest, RetryDetectsPostLoadDiskCorruptionAndFailsClosed) {
+  Directory directory;
+  DurableFlatIndex index(directory.options());
+  (void)index.commit("one", 1, kVector);
+  (void)index.checkpoint();
+  auto bytes = read(directory.path / "dedup-1.fvd");
+  bytes[56 + 72 + 3] ^= 1;
+  write(directory.path / "dedup-1.fvd", bytes);
+  EXPECT_THROW((void)index.commit("one", 1, kVector), std::runtime_error);
+  EXPECT_TRUE(index.durability_stats().recovery_required);
+  EXPECT_THROW((void)index.commit("two", 2, kVector), RecoveryRequiredError);
+}
+TEST(DurableFlatIndexTest, SigkillDuringPairedCheckpointKeepsAcknowledgedWritesRecoverable) {
+  for (const auto boundary :
+       {WalBoundary::BeforeCheckpointPublish, WalBoundary::AfterCheckpointRename}) {
+    Directory directory;
+    int descriptors[2];
+    ASSERT_EQ(pipe(descriptors), 0);
+    const auto pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      close(descriptors[0]);
+      bool armed = false;
+      auto options = directory.options();
+      options.fault_hook = [&](WalBoundary actual) {
+        if (armed && boundary == actual) {
+          kill(getpid(), SIGKILL);
+          _exit(91);
+        }
+      };
+      DurableFlatIndex index(options);
+      (void)index.commit("one", 1, kVector);
+      (void)index.checkpoint();
+      (void)index.commit("two", 2, kVector);
+      const char ack = '2';
+      if (::write(descriptors[1], &ack, 1) != 1) _exit(92);
+      armed = true;
+      (void)index.checkpoint();
+      _exit(93);
+    }
+    close(descriptors[1]);
+    char ack = 0;
+    ASSERT_EQ(::read(descriptors[0], &ack, 1), 1);
+    close(descriptors[0]);
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    ASSERT_EQ(WTERMSIG(status), SIGKILL);
+    EXPECT_EQ(ack, '2');
+    DurableFlatIndex recovered(directory.options());
+    EXPECT_EQ(recovered.size(), 2);
+    EXPECT_TRUE(recovered.commit("one", 1, kVector).replayed);
+    EXPECT_TRUE(recovered.commit("two", 2, kVector).replayed);
+    EXPECT_EQ(recovered.durability_stats().checkpoint_lsn,
+              boundary == WalBoundary::BeforeCheckpointPublish ? 1 : 2);
+  }
+}
+std::filesystem::path active_wal(const Directory& directory) {
+  const auto root = read(directory.path / "recovery.manifest");
+  if (root.size() != 168) throw std::runtime_error("expected segmented manifest");
+  return directory.path /
+         std::string(root.begin() + 96, std::find(root.begin() + 96, root.begin() + 160, 0));
+}
+TEST(WalRotationTest, AutomaticRotationKeepsLsnRetryAndOnlyCurrentRecoveryArtifacts) {
+  Directory directory;
+  auto options = directory.options();
+  options.rotate_on_checkpoint = true;
+  options.maximum_wal_bytes = 150;
+  {
+    DurableFlatIndex index(options);
+    for (std::uint64_t id = 1; id <= 8; ++id)
+      EXPECT_EQ(index.commit("op" + std::to_string(id), id, kVector).lsn, id);
+    EXPECT_GT(index.durability_stats().wal_generation, 0);
+    EXPECT_LE(index.durability_stats().active_wal_bytes, 150);
+    EXPECT_FALSE(std::filesystem::exists(directory.path / "operations.wal"));
+    const auto generation = index.durability_stats().wal_generation;
+    for (std::uint64_t id = 1; id <= 8; ++id)
+      EXPECT_TRUE(index.commit("op" + std::to_string(id), id, kVector).replayed);
+    EXPECT_EQ(index.durability_stats().wal_generation, generation);
+    const auto before = index.search(kVector, 8);
+    EXPECT_EQ(index.checkpoint(), 8);
+    EXPECT_EQ(index.durability_stats().active_wal_bytes, 72);
+    EXPECT_EQ(index.checkpoint(), 8);  // Repeated same-LSN checkpoints must have distinct segments.
+    EXPECT_EQ(index.search(kVector, 8), before);
+    EXPECT_FALSE(index.durability_stats().cleanup_pending);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory.path), {}), 5);
+  }
+  options.rotate_on_checkpoint = false;  // Persisted mode must remain authoritative.
+  DurableFlatIndex recovered(options);
+  EXPECT_EQ(recovered.size(), 8);
+  EXPECT_EQ(recovered.durability_stats().wal_scan_bytes, 0);
+  EXPECT_EQ(recovered.commit("next", 9, kVector).lsn, 9);
+  EXPECT_EQ(recovered.checkpoint(), 9);
+}
+TEST(WalRotationTest, CheckpointAndSingleRecordCapsFailBeforeNewWrite) {
+  Directory directory;
+  auto options = directory.options();
+  options.rotate_on_checkpoint = true;
+  options.maximum_wal_bytes = 150;
+  options.maximum_checkpoint_bytes = 100;
+  DurableFlatIndex index(options);
+  (void)index.commit("one", 1, kVector);
+  EXPECT_THROW((void)index.commit("two", 2, kVector), ResourceExhausted);
+  EXPECT_FALSE(index.durability_stats().recovery_required);
+  EXPECT_TRUE(index.commit("one", 1, kVector).replayed);
+  EXPECT_EQ(index.durability_stats().applied_lsn, 1);
+  EXPECT_THROW((void)index.commit(std::string(256, 'x'), 3, kVector), std::length_error);
+}
+TEST(WalRotationTest, PartialActiveTailAndWrongSegmentIdentityAreHandledExplicitly) {
+  Directory directory;
+  auto options = directory.options();
+  options.rotate_on_checkpoint = true;
+  std::filesystem::path path;
+  Bytes complete;
+  {
+    DurableFlatIndex index(options);
+    (void)index.commit("one", 1, kVector);
+    (void)index.checkpoint();
+    path = active_wal(directory);
+    (void)index.commit("two", 2, kVector);
+    complete = read(path);
+  }
+  auto partial = complete;
+  partial.resize(complete.size() - 1);
+  write(path, partial);
+  {
+    DurableFlatIndex index(options);
+    EXPECT_EQ(index.size(), 1);
+    EXPECT_EQ(index.durability_stats().discarded_tail_bytes, partial.size() - 72);
+    EXPECT_EQ(index.commit("two", 2, kVector).lsn, 2);
+  }
+  auto wrong = read(path);
+  put(wrong, 32, 1);
+  put(wrong, 64, hash(wrong, 0, 64));
+  write(path, wrong);
+  EXPECT_THROW(DurableFlatIndex{options}, std::runtime_error);
+  write(path, complete);
+  std::filesystem::remove(path);
+  EXPECT_THROW(DurableFlatIndex{options}, std::system_error);
+  EXPECT_FALSE(std::filesystem::exists(directory.path / "operations.wal"));
+}
+TEST(WalRotationTest, CleanupFailureIsObservableAndRetriedAtStartupWithoutRemovingOtherFiles) {
+  Directory directory;
+  bool fail = true;
+  auto options = directory.options();
+  options.rotate_on_checkpoint = true;
+  options.fault_hook = [&](WalBoundary boundary) {
+    if (fail && boundary == WalBoundary::BeforeWalCleanup)
+      throw std::runtime_error("cleanup failure");
+  };
+  {
+    DurableFlatIndex index(options);
+    (void)index.commit("one", 1, kVector);
+    (void)index.checkpoint();
+    EXPECT_TRUE(index.durability_stats().cleanup_pending);
+    EXPECT_FALSE(index.durability_stats().recovery_required);
+    EXPECT_TRUE(std::filesystem::exists(directory.path / "operations.wal"));
+    EXPECT_EQ(index.commit("two", 2, kVector).lsn, 2);
+  }
+  write(directory.path / "notes.txt", Bytes{1, 2, 3});
+  write(directory.path / "wal-user-backup", Bytes{4});
+  fail = false;
+  DurableFlatIndex recovered(options);
+  EXPECT_EQ(recovered.size(), 2);
+  EXPECT_FALSE(recovered.durability_stats().cleanup_pending);
+  EXPECT_FALSE(std::filesystem::exists(directory.path / "operations.wal"));
+  EXPECT_TRUE(std::filesystem::exists(directory.path / "notes.txt"));
+  EXPECT_TRUE(std::filesystem::exists(directory.path / "wal-user-backup"));
+  EXPECT_TRUE(recovered.commit("one", 1, kVector).replayed);
+}
+TEST(WalRotationTest, SigkillAcrossPublicationSwitchAndCleanupPreservesAcknowledgedWrites) {
+  for (const auto boundary : {WalBoundary::AfterWalCreated, WalBoundary::BeforeCheckpointPublish,
+                              WalBoundary::AfterCheckpointRename, WalBoundary::BeforeWriterSwitch,
+                              WalBoundary::AfterWriterSwitch, WalBoundary::BeforeWalCleanup,
+                              WalBoundary::AfterWalCleanup}) {
+    Directory directory;
+    int descriptors[2];
+    ASSERT_EQ(pipe(descriptors), 0);
+    const auto pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      close(descriptors[0]);
+      bool armed = false;
+      auto options = directory.options();
+      options.rotate_on_checkpoint = true;
+      options.fault_hook = [&](WalBoundary actual) {
+        if (armed && actual == boundary) {
+          kill(getpid(), SIGKILL);
+          _exit(94);
+        }
+      };
+      DurableFlatIndex index(options);
+      (void)index.commit("one", 1, kVector);
+      (void)index.checkpoint();
+      (void)index.commit("two", 2, kVector);
+      const char ack = '2';
+      if (::write(descriptors[1], &ack, 1) != 1) _exit(95);
+      armed = true;
+      (void)index.checkpoint();
+      _exit(96);
+    }
+    close(descriptors[1]);
+    char ack = 0;
+    ASSERT_EQ(::read(descriptors[0], &ack, 1), 1);
+    close(descriptors[0]);
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(WTERMSIG(status), SIGKILL);
+    EXPECT_EQ(ack, '2');
+    DurableFlatIndex recovered(directory.options());
+    EXPECT_EQ(recovered.size(), 2);
+    EXPECT_TRUE(recovered.commit("one", 1, kVector).replayed);
+    EXPECT_TRUE(recovered.commit("two", 2, kVector).replayed);
+    EXPECT_EQ(recovered.commit("three", 3, kVector).lsn, 3);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory.path), {}), 5);
+  }
+}
+TEST(WalRotationTest, RejectsSharedCleanupDirectoryAndFailsClosedAtWriterSwitch) {
+  {
+    Directory directory;
+    auto options = directory.options();
+    options.rotate_on_checkpoint = true;
+    std::filesystem::permissions(directory.path, std::filesystem::perms::group_write,
+                                 std::filesystem::perm_options::add);
+    EXPECT_THROW(DurableFlatIndex{options}, std::invalid_argument);
+  }
+  for (const auto boundary : {WalBoundary::BeforeWriterSwitch, WalBoundary::AfterWriterSwitch}) {
+    Directory directory;
+    auto options = directory.options();
+    options.rotate_on_checkpoint = true;
+    options.fault_hook = [&](WalBoundary actual) {
+      if (actual == boundary) throw std::runtime_error("switch failure");
+    };
+    {
+      DurableFlatIndex index(options);
+      (void)index.commit("one", 1, kVector);
+      EXPECT_THROW((void)index.checkpoint(), std::runtime_error);
+      EXPECT_TRUE(index.durability_stats().recovery_required);
+      EXPECT_THROW((void)index.commit("two", 2, kVector), RecoveryRequiredError);
+    }
+    DurableFlatIndex recovered(directory.options());
+    EXPECT_TRUE(recovered.commit("one", 1, kVector).replayed);
+    EXPECT_EQ(recovered.commit("two", 2, kVector).lsn, 2);
+  }
+}
+TEST(WalRotationTest, CheckpointVerificationHonorsConfiguredDimensionLimit) {
+  Directory directory;
+  auto options = directory.options();
+  options.rotate_on_checkpoint = true;
+  options.dimension = 70000;
+  options.limits.maximum_dimension = 70000;
+  const std::vector<float> values(options.dimension, 1);
+  {
+    DurableFlatIndex index(options);
+    (void)index.commit("wide", 1, values);
+    EXPECT_EQ(index.checkpoint(), 1);
+  }
+  DurableFlatIndex recovered(options);
+  EXPECT_TRUE(recovered.commit("wide", 1, values).replayed);
+  EXPECT_EQ(recovered.dimension(), 70000);
+}
+TEST(WalRotationTest, MissingManifestNeverBootstrapsAnEmptyReplacement) {
+  {
+    Directory orphan;
+    auto options = orphan.options();
+    options.rotate_on_checkpoint = true;
+    options.fault_hook = [](WalBoundary boundary) {
+      if (boundary == WalBoundary::BeforeCheckpointPublish)
+        throw std::runtime_error("initial publication failed");
+    };
+    {
+      DurableFlatIndex index(options);
+      (void)index.commit("one", 1, kVector);
+      EXPECT_THROW((void)index.checkpoint(), std::runtime_error);
+      EXPECT_FALSE(index.durability_stats().recovery_required);
+      EXPECT_EQ(index.commit("two", 2, kVector).lsn, 2);
+    }
+    DurableFlatIndex recovered(orphan.options());
+    EXPECT_TRUE(recovered.commit("one", 1, kVector).replayed);
+    EXPECT_TRUE(recovered.commit("two", 2, kVector).replayed);
+  }
+  Directory directory;
+  auto options = directory.options();
+  options.rotate_on_checkpoint = true;
+  {
+    DurableFlatIndex index(options);
+    (void)index.commit("one", 1, kVector);
+    (void)index.checkpoint();
+  }
+  std::filesystem::remove(directory.path / "recovery.manifest");
+  EXPECT_THROW(DurableFlatIndex{directory.options()}, std::runtime_error);
+  EXPECT_FALSE(std::filesystem::exists(directory.path / "operations.wal"));
 }
 }  // namespace

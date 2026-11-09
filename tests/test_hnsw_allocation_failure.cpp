@@ -265,6 +265,79 @@ TEST(WalAllocationFailureTest, EveryPostSyncAllocationFailureRequiresRecovery) {
   EXPECT_GT(failures, 0);
   std::cout << "Verified post-sync allocation failure points: " << failures << '\n';
 }
+void verify_checkpoint_allocation_failures(bool rotate) {
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("fast-vector-dedup-allocation-" +
+                          std::to_string(reinterpret_cast<std::uintptr_t>(&allocations_left)) +
+                          "-" + std::to_string(rotate));
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  const fast_vector::WalOptions options{
+      .directory = directory, .dimension = 3, .fault_hook = {}, .rotate_on_checkpoint = rotate};
+  const std::vector<float> values{1, 2, 3};
+  auto root_bytes = [&] {
+    std::ifstream input(directory / "recovery.manifest", std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(input), {});
+  };
+  const auto descriptor_count = [] {
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+      (void)entry;
+      ++count;
+    }
+    return count;
+  };
+  bool completed = false;
+  std::size_t failures = 0;
+  {
+    fast_vector::DurableFlatIndex index(options);
+    (void)index.commit("one", 1, values);
+    (void)index.checkpoint();
+    (void)index.commit("two", 2, values);
+    const auto before = root_bytes();
+    const auto before_descriptors = descriptor_count();
+    for (std::ptrdiff_t point = 0; point < 512; ++point) {
+      bool rejected = false;
+      try {
+        const FailAllocationsAfter failure(point);
+        (void)index.checkpoint();
+      } catch (const std::bad_alloc&) {
+        rejected = true;
+      }
+      // iostreams may translate a failed buffer allocation into an I/O exception.
+      catch (const std::exception&) {
+        rejected = true;
+      }
+      if (!rejected) {
+        completed = true;
+        break;
+      }
+      ++failures;
+      EXPECT_EQ(root_bytes(), before);
+      EXPECT_EQ(descriptor_count(), before_descriptors);
+      EXPECT_FALSE(index.durability_stats().recovery_required);
+      EXPECT_EQ(index.size(), 2);
+      EXPECT_TRUE(index.commit("one", 1, values).replayed);
+      EXPECT_TRUE(index.commit("two", 2, values).replayed);
+    }
+  }
+  EXPECT_TRUE(completed);
+  EXPECT_GT(failures, 0);
+  {
+    fast_vector::DurableFlatIndex recovered(options);
+    EXPECT_EQ(recovered.durability_stats().wal_scan_bytes, 0);
+    EXPECT_TRUE(recovered.commit("one", 1, values).replayed);
+    EXPECT_TRUE(recovered.commit("two", 2, values).replayed);
+  }
+  std::filesystem::remove_all(directory);
+  std::cout << "Verified checkpoint allocation failure points (rotation=" << rotate
+            << "): " << failures << '\n';
+}
+TEST(WalAllocationFailureTest, PairedCheckpointAllocationFailuresPreserveOldRootAndRetrySources) {
+  verify_checkpoint_allocation_failures(false);
+}
+TEST(WalAllocationFailureTest, RotatingCheckpointAllocationFailuresPreserveOldRootAndRetrySources) {
+  verify_checkpoint_allocation_failures(true);
+}
 #endif
 
 }  // namespace

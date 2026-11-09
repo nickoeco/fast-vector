@@ -23,7 +23,11 @@ jobs:
             echo "CXX=clang++" >> "$GITHUB_ENV"
           fi
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFAST_VECTOR_ENABLE_SANITIZERS=ON
+        # Crypto is used by core WAL request fingerprints, not only by gRPC.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFAST_VECTOR_ENABLE_SANITIZERS=ON
       - name: Build
         run: cmake --build build --parallel
       - name: Test
@@ -48,6 +52,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure ThreadSanitizer
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
           cmake -S . -B build-tsan \
             -DCMAKE_BUILD_TYPE=Debug \
             -DFAST_VECTOR_ENABLE_THREAD_SANITIZER=ON \
@@ -64,6 +70,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure without AVX2
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
           cmake -S . -B build-noavx \
             -DCMAKE_BUILD_TYPE=Debug \
             -DFAST_VECTOR_ENABLE_AVX2=OFF \
