@@ -129,7 +129,7 @@ grpc::Status VectorSearchService::AddVector(grpc::ServerContext* context,
     const v1::Vector& vector = request->vector();
     const auto result = store_->add(
         vector.id(), std::span<const float>(vector.values().data(), vector.values().size()),
-        request->client_operation_id());
+        request->client_operation_id(), request->dedup_epoch());
     response->set_index_size(result.index_size);
     response->set_lsn(result.lsn);
     response->set_replayed(result.replayed);
@@ -140,12 +140,15 @@ grpc::Status VectorSearchService::AddVector(grpc::ServerContext* context,
 }
 
 grpc::Status VectorSearchService::Checkpoint(grpc::ServerContext* context,
-                                             const v1::CheckpointRequest*,
+                                             const v1::CheckpointRequest* request,
                                              v1::CheckpointResponse* response) {
   const auto call = begin_rpc("Checkpoint");
   if (context->IsCancelled()) return finish_rpc(call, cancelled_status(*context));
   try {
-    response->set_lsn(store_->checkpoint());
+    const auto result = store_->checkpoint_result(request->expected_epoch());
+    response->set_lsn(result.lsn);
+    response->set_current_epoch(result.current_epoch);
+    response->set_oldest_epoch(result.oldest_epoch);
     return finish_rpc(call, grpc::Status::OK);
   } catch (const std::exception& error) {
     return finish_rpc(call, exception_status(error));
@@ -379,6 +382,13 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     durable->set_active_wal_bytes(durability.active_wal_bytes);
     durable->set_cleaned_files(durability.cleaned_files);
     durable->set_cleanup_pending(durability.cleanup_pending);
+    durable->set_current_epoch(durability.current_epoch);
+    durable->set_oldest_epoch(durability.oldest_epoch);
+    durable->set_retained_epochs(durability.retained_epochs);
+    durable->set_current_epoch_operations(durability.current_epoch_operations);
+    durable->set_current_epoch_bytes(durability.current_epoch_bytes);
+    durable->set_maximum_epoch_operations(durability.maximum_epoch_operations);
+    durable->set_maximum_epoch_bytes(durability.maximum_epoch_bytes);
     const auto scheduler = executor_->stats();
     auto* scheduling = response->mutable_search_executor();
     scheduling->set_workers(scheduler.workers);
@@ -418,6 +428,8 @@ grpc::Status VectorSearchService::cancelled_status(const grpc::ServerContext& co
 }
 
 grpc::Status VectorSearchService::exception_status(const std::exception& error) {
+  if (dynamic_cast<const DedupEpochError*>(&error))
+    return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
   if (dynamic_cast<const ResourceExhausted*>(&error) || dynamic_cast<const std::bad_alloc*>(&error))
     return {grpc::StatusCode::RESOURCE_EXHAUSTED, "resource budget exceeded"};
   if (dynamic_cast<const RecoveryRequiredError*>(&error)) {

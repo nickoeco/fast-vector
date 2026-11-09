@@ -10,6 +10,7 @@ message Vector {
 message AddVectorRequest {
   Vector vector = 1;
   string client_operation_id = 2;
+  uint64 dedup_epoch = 3;
 }
 
 message AddVectorResponse {
@@ -18,8 +19,12 @@ message AddVectorResponse {
   bool replayed = 3;
 }
 
-message CheckpointRequest {}
-message CheckpointResponse { uint64 lsn = 1; }
+message CheckpointRequest { uint64 expected_epoch = 1; }
+message CheckpointResponse {
+  uint64 lsn = 1;
+  uint64 current_epoch = 2;
+  uint64 oldest_epoch = 3;
+}
 
 message DurabilityStats {
   bool enabled = 1;
@@ -40,6 +45,13 @@ message DurabilityStats {
   uint64 active_wal_bytes = 16;
   uint64 cleaned_files = 17;
   bool cleanup_pending = 18;
+  uint64 current_epoch = 19;
+  uint64 oldest_epoch = 20;
+  uint64 retained_epochs = 21;
+  uint64 current_epoch_operations = 22;
+  uint64 current_epoch_bytes = 23;
+  uint64 maximum_epoch_operations = 24;
+  uint64 maximum_epoch_bytes = 25;
 }
 
 message BatchAddRequest {

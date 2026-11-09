@@ -180,6 +180,49 @@ class WalRecoveryIntegrationTest(unittest.TestCase):
         self.assertEqual(client.checkpoint().lsn,101)
         self.assertGreater(client.stats().durability.wal_generation,stats.wal_generation)
 
+    def test_epoch_retention_rejects_expired_requests_after_restart(self):
+        directory=self.root/"epochs"
+        directory.mkdir()
+        process,client=self.start(directory,("--dedup-retention","true","--dedup-max-operations","1"))
+        self.assertEqual(client.stats().durability.current_epoch,1)
+        self.assertEqual(client.add(1,[1,0,0],"one",1).lsn,1)
+        with self.assertRaises(grpc.RpcError) as error:
+            client.add(2,[0,1,0],"two",1)
+        self.assertEqual(error.exception.code(),grpc.StatusCode.RESOURCE_EXHAUSTED)
+        self.assertTrue(client.add(1,[1,0,0],"one",1).replayed)
+        self.assertEqual(client.checkpoint(1).current_epoch,2)
+        with self.assertRaises(grpc.RpcError) as error:
+            client.checkpoint(1)
+        self.assertEqual(error.exception.code(),grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertEqual(client.stats().durability.current_epoch,2)
+        self.assertEqual(client.add(2,[0,1,0],"one",2).lsn,2)
+        client.checkpoint(2) # epoch 3, oldest 1
+        self.assertTrue(client.add(1,[1,0,0],"one",1).replayed)
+        result=client.checkpoint(3) # epoch 4, oldest 2
+        self.assertEqual((result.current_epoch,result.oldest_epoch),(4,2))
+        before=client.search([1,0,0],10)
+        process.kill()
+        self.assertEqual(process.wait(timeout=5),-signal.SIGKILL)
+        client.close()
+        process,client=self.start(directory)
+        self.assertEqual(client.stats().durability.current_epoch,4)
+        for epoch in (0,1,5):
+            with self.assertRaises(grpc.RpcError) as error:
+                client.add(99,[1,0,0],"missing",epoch)
+            self.assertEqual(error.exception.code(),grpc.StatusCode.FAILED_PRECONDITION)
+        with self.assertRaises(grpc.RpcError) as error:
+            client.add(1,[1,0,0],"one",1)
+        self.assertEqual(error.exception.code(),grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertTrue(client.add(2,[0,1,0],"one",2).replayed)
+        after=client.search([1,0,0],10)
+        self.assertEqual([(n.id,n.score) for n in before.neighbors],[(n.id,n.score) for n in after.neighbors])
+        self.assertEqual(client.stats().durability.applied_lsn,2)
+        self.assertEqual(client.stats().durability.dedup_entries,1)
+        self.assertEqual(client.add(3,[0,0,1],"next",4).lsn,3)
+        invalid=subprocess.run([str(self.server),"--index","flat","--dedup-retention","true",
+                                "--address","127.0.0.1:0"],capture_output=True,text=True,timeout=10)
+        self.assertNotEqual(invalid.returncode,0)
+
     def test_corrupt_complete_record_prevents_server_listening(self):
         directory = self.root / "corrupt"
         directory.mkdir()

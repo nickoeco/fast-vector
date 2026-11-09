@@ -59,13 +59,15 @@ class VectorSearchClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def add(self, vector_id: int, values: Sequence[float], client_operation_id: str = ""):
+    def add(self, vector_id: int, values: Sequence[float], client_operation_id: str = "", dedup_epoch: int = 0):
         vector = self._messages.Vector(id=vector_id, values=values)
-        request = self._messages.AddVectorRequest(vector=vector, client_operation_id=client_operation_id)
+        request = self._messages.AddVectorRequest(vector=vector, client_operation_id=client_operation_id,
+                                                 dedup_epoch=dedup_epoch)
         return self._stub.AddVector(request, timeout=self._timeout_seconds)
 
-    def checkpoint(self):
-        return self._stub.Checkpoint(self._messages.CheckpointRequest(), timeout=self._timeout_seconds)
+    def checkpoint(self, expected_epoch: int = 0):
+        return self._stub.Checkpoint(self._messages.CheckpointRequest(expected_epoch=expected_epoch),
+                                    timeout=self._timeout_seconds)
 
     def add_batch(self, vectors: Sequence[tuple[int, Sequence[float]]]):
         request = self._messages.BatchAddRequest(
@@ -123,6 +125,7 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     add_parser.add_argument("--id", type=int, required=True)
     add_parser.add_argument("--vector", type=parse_vector, required=True)
     add_parser.add_argument("--operation-id", default="")
+    add_parser.add_argument("--dedup-epoch", type=int, default=0)
 
     batch_parser = subparsers.add_parser("batch-add")
     batch_parser.add_argument(
@@ -135,7 +138,8 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     search_parser.add_argument("--expected-snapshot-id", default="")
 
     subparsers.add_parser("stats")
-    subparsers.add_parser("checkpoint")
+    checkpoint_parser=subparsers.add_parser("checkpoint")
+    checkpoint_parser.add_argument("--expected-epoch",type=int,default=0)
     return parser.parse_args(arguments)
 
 
@@ -143,7 +147,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     options = parse_arguments(arguments)
     with VectorSearchClient(options.address, options.generated_dir, options.timeout) as client:
         if options.command == "add":
-            response = client.add(options.id, options.vector, options.operation_id)
+            response = client.add(options.id, options.vector, options.operation_id,options.dedup_epoch)
         elif options.command == "batch-add":
             records = json.loads(options.input.read_text(encoding="utf-8"))
             vectors = [(record["id"], record["values"]) for record in records]
@@ -151,7 +155,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         elif options.command == "search":
             response = client.search(options.query, options.k, options.expected_snapshot_id)
         elif options.command == "checkpoint":
-            response = client.checkpoint()
+            response = client.checkpoint(options.expected_epoch)
         else:
             response = client.stats()
     print(json.dumps(response_to_dictionary(response), indent=2, sort_keys=True))

@@ -77,6 +77,9 @@ struct ServerConfig {
   std::uint64_t snapshot_memory_bytes = 2ULL * 1024 * 1024 * 1024;
   bool wal_rotation = false;
   std::uint64_t maximum_checkpoint_bytes = 2ULL * 1024 * 1024 * 1024;
+  bool dedup_retention = false;
+  std::uint64_t retained_epochs = 3, maximum_epoch_operations = 100000,
+                maximum_epoch_bytes = 268435456;
 };
 
 bool parse_bool(const std::string_view value, const std::string& option) {
@@ -183,6 +186,14 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
     } else if (option == "--wal-dir") {
       config.wal_directory = value;
       if (value.empty()) throw std::invalid_argument("--wal-dir must not be empty");
+    } else if (option == "--dedup-retention") {
+      config.dedup_retention = parse_bool(value, option);
+    } else if (option == "--dedup-retained-epochs") {
+      config.retained_epochs = parse_positive_size(value, option);
+    } else if (option == "--dedup-max-operations") {
+      config.maximum_epoch_operations = parse_positive_size(value, option);
+    } else if (option == "--dedup-max-bytes") {
+      config.maximum_epoch_bytes = parse_positive_size(value, option);
     } else if (option == "--wal-rotation") {
       config.wal_rotation = parse_bool(value, option);
     } else if (option == "--max-checkpoint-bytes") {
@@ -211,6 +222,8 @@ ServerConfig parse_arguments(const int argc, char* argv[]) {
     throw std::invalid_argument("--address must not be empty");
   }
   config.publication.kernel = config.kernel;
+  if (config.dedup_retention && config.wal_directory.empty())
+    throw std::invalid_argument("dedup retention requires --wal-dir");
   config.memory_budget = std::make_shared<fast_vector::MemoryBudget>(config.snapshot_memory_bytes);
   if (!config.wal_directory.empty() &&
       (config.index_type != "flat" || config.read_only || !config.load_index_path.empty() ||
@@ -308,7 +321,11 @@ std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config,
                                 .limits = config.limits,
                                 .loading_budget = config.memory_budget,
                                 .rotate_on_checkpoint = config.wal_rotation,
-                                .maximum_checkpoint_bytes = config.maximum_checkpoint_bytes});
+                                .maximum_checkpoint_bytes = config.maximum_checkpoint_bytes,
+                                .dedup_retention = config.dedup_retention,
+                                .retained_epochs = config.retained_epochs,
+                                .maximum_epoch_operations = config.maximum_epoch_operations,
+                                .maximum_epoch_bytes = config.maximum_epoch_bytes});
     const auto stats = index->durability_stats();
     logger.write({.event = "wal_recovery_completed",
                   .status = "OK",
@@ -319,6 +336,8 @@ std::unique_ptr<fast_vector::VectorIndex> make_index(const ServerConfig& config,
                   {"checkpoint_lsn", stats.checkpoint_lsn},
                   {"discarded_tail_bytes", stats.discarded_tail_bytes},
                   {"wal_generation", stats.wal_generation},
+                  {"dedup_current_epoch", stats.current_epoch},
+                  {"dedup_oldest_epoch", stats.oldest_epoch},
                   {"cleanup_pending", stats.cleanup_pending}});
     return index;
   }
@@ -353,7 +372,9 @@ constexpr char kUsage[] =
     "[--wal-dir EXISTING_DIRECTORY] [--max-wal-bytes N] [--wal-rotation true|false] "
     "[--max-checkpoint-bytes N] "
     "[--search-queue-bytes N] [--max-top-k K] [--max-index-vectors N] "
-    "[--max-dimension D] [--max-index-bytes N] [--memory-budget-bytes N]";
+    "[--max-dimension D] [--max-index-bytes N] [--memory-budget-bytes N] "
+    "[--dedup-retention true|false] [--dedup-retained-epochs N] "
+    "[--dedup-max-operations N] [--dedup-max-bytes N]";
 
 void log_config(const ServerConfig& config, const fast_vector::VectorIndex& index,
                 StructuredLogger& logger) {
@@ -393,7 +414,11 @@ void log_config(const ServerConfig& config, const fast_vector::VectorIndex& inde
                {{"wal_enabled", !config.wal_directory.empty()},
                 {"maximum_wal_bytes", config.maximum_wal_bytes},
                 {"wal_rotation_requested", config.wal_rotation},
-                {"maximum_checkpoint_bytes", config.maximum_checkpoint_bytes}});
+                {"maximum_checkpoint_bytes", config.maximum_checkpoint_bytes},
+                {"dedup_retention_requested", config.dedup_retention},
+                {"retained_epochs_requested", config.retained_epochs},
+                {"epoch_operations_requested", config.maximum_epoch_operations},
+                {"epoch_bytes_requested", config.maximum_epoch_bytes}});
   logger.write({.event = "resource_limits", .index_type = config.index_type},
                {{"max_dimension", config.limits.maximum_dimension},
                 {"max_vectors", config.limits.maximum_vectors},
