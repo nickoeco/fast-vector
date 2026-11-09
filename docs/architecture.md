@@ -144,8 +144,12 @@ and checkpoint publication under its existing exclusive lock. Every operation ap
 fdatasyncs original/normalized float bits before applying the latter to memory. Any uncertain
 append/sync or post-sync application failure blocks writes until startup recovery. Checkpoint
 publication uses a verified immutable Flat snapshot followed by a durable recovery manifest.
-The complete retained WAL reconstructs historical retry IDs; only its suffix is applied after
-loading a checkpoint. No log pruning or HNSW recovery is provided. See [WAL recovery](wal_recovery.md).
+Version 2 recovery restores retry metadata from a paired deduplication checkpoint and reads only
+the WAL suffix. Legacy manifests retain full-scan recovery. Exact request bits live on disk,
+not in the in-memory retry table. Opt-in checkpoint-bound WAL rotation publishes a new segment
+and cleans unreferenced artifacts after durable publication. Operation expiry and HNSW recovery
+are not provided. See [WAL rotation](wal_rotation.md),
+[WAL recovery](wal_recovery.md) and [deduplication checkpoints](dedup_checkpoint.md).
 
 ## Structured service logs
 

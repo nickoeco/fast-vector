@@ -43,7 +43,9 @@ for flags, accounting formulas and the distinction between admission credits and
 - CMake 3.20 or newer
 - A C++20 compiler (GCC or Clang)
 - Network access during the first test configuration: CMake FetchContent downloads
-  GoogleTest 1.15.2. The library and demo have no runtime third-party dependencies.
+  GoogleTest 1.15.2.
+- OpenSSL Crypto development files for WAL request fingerprints (`sudo apt-get install libssl-dev`
+  on Ubuntu). This is a core dependency, including builds without gRPC.
 - Optional gRPC build: protobuf compiler and development files, the gRPC C++ development
   package, `grpc_cpp_plugin`, and OpenSSL Crypto. On Ubuntu 22.04/WSL2 these are available through
   `protobuf-compiler`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `libgrpc++-dev`, and `libssl-dev`.
@@ -369,8 +371,12 @@ Without `--wal-dir`, insertion remains volatile.
 
 The `Checkpoint` RPC pauses writes and safely publishes a snapshot and recovery manifest.
 Startup validates and restores the index and retry table before listening. A sync or post-sync
-application failure stops writes until restart. The entire WAL is retained in this first version;
-checkpoints do not yet eliminate its scan or bound disk/retry-table growth. A configured WAL
+application failure stops writes until restart. New checkpoints also persist the deduplication
+state: memory retains metadata and disk references, while exact original request bits remain
+on disk. Version 2 recovery scans only the WAL suffix; legacy manifests still scan the full WAL.
+All historical operation IDs remain retained. Opt-in `--wal-rotation true` rotates the WAL at
+checkpoint and cleans obsolete recovery artifacts; expiry is not implemented yet. See
+[WAL rotation](docs/wal_rotation.md) and [deduplication checkpoints](docs/dedup_checkpoint.md). A configured WAL
 byte limit refuses new operations rather than deleting history. See
 [WAL recovery](docs/wal_recovery.md) for the binary format, failure contract, storage assumptions,
 commands, fault tests and process-termination versus power-loss boundary.

@@ -38,7 +38,8 @@ Every arithmetic product/sum is checked for overflow before admission. The formu
 include metadata allowances; they can reject work whose actual allocation would fit.
 
 - Flat shape cost: `N * (4*d + 512)` bytes.
-- Durable Flat cost: `N * (8*d + 768)`, including retained original request vectors and retry state.
+- Durable Flat cost: `N * (4*d + 1024)`, including the index and retry metadata. Historical
+  original request vectors are disk-backed. Per-request/record buffers remain dimension-sized.
 - Writable HNSW uses physical N and a conservative 64-level envelope per node:
   `N * (4*d + 512 + 64*(48 + 32*M))`. This may be substantially larger than typical graphs.
 - Read-only HNSW shared accounting uses `N*(4*d+512) + 16*edges + 48*N*(max_level+1)`.

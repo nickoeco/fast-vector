@@ -16,11 +16,13 @@ The internal components in `src/durable_flat_index.cpp` have separate responsibi
 - `CheckpointManager`: publish an immutable snapshot and then its recovery manifest.
 - `DurableFlatIndex::Impl`: validate, deduplicate, coordinate commit and fail closed.
 
-This first version deliberately retains the entire WAL and all historical operation IDs.
-Checkpointed operations are validated and used to reconstruct retry state; only the suffix
-after the checkpoint LSN is applied to the index. A checkpoint therefore reduces index replay
-work, but does not eliminate the WAL scan or bound the retry table. There is no log rotation,
-garbage collection, group commit, durable deletion, transactional batch insertion, HNSW recovery,
+All historical operation IDs remain retained. With rotation disabled the entire WAL is retained;
+opt-in [WAL rotation](wal_rotation.md) adds a version-3 recovery root and safe artifact cleanup.
+New version 2 recovery
+manifests reference a paired deduplication checkpoint, restoring retry metadata without scanning
+the old WAL prefix. Version 1 recovery still scans the full log. Raw requests are disk-backed;
+see [deduplication checkpoints](dedup_checkpoint.md) for the current format and publication rules.
+There is no operation expiry, group commit, durable deletion, transactional batch insertion, HNSW recovery,
 writable replication, writable snapshot reload or automatic repair of corrupt files.
 
 ## Meaning of success
@@ -47,7 +49,8 @@ or checkpoint is accepted until restart. Queries can still read the last success
 in-memory state. A fully written operation whose response failed may appear after recovery;
 an incomplete trailing operation may disappear. Clients must retry using the same operation ID.
 
-Recovery validates the entire accepted prefix before truncating an incomplete final record.
+Recovery validates required checkpoint files and all required WAL records before truncating an
+incomplete final record. Version 2 starts WAL validation at the checkpoint boundary.
 It then synchronizes the accepted WAL prefix, including any complete unacknowledged record,
 before returning. Otherwise a retry might acknowledge page-cache-only data without a new sync.
 The server does not bind a port until this recovery finishes. Startup corruption fails closed;
@@ -63,10 +66,11 @@ existing VectorId are also rejected. In particular, `+0.0` and `-0.0` are differ
 bits, and differently scaled vectors are different requests even if their directions agree.
 Non-finite and zero vectors are rejected.
 
-The WAL stores both original input bits and the once-normalized bits. Original bits reconstruct
-the retry table; normalized bits are applied directly on recovery after finite/norm validation.
-They are not normalized a second time. Checkpoint vectors are checked bit for bit against the
-WAL prefix. Successful retries retain the original `index_size` result, which can be less than
+The WAL stores both original input bits and the once-normalized bits. Original bits are referenced
+on disk; normalized bits are applied directly on recovery after finite/norm validation.
+They are not normalized a second time. Legacy recovery checks checkpoint vectors against the
+WAL prefix; version 2 validates the paired files and uses the saved boundary. Successful retries
+retain the original `index_size` result, which can be less than
 the current size. `inserted_vectors` counts new applications in this process, not recovery or
 retries. This is scoped persistent deduplication, not end-to-end exactly-once delivery.
 
@@ -127,7 +131,7 @@ While holding the exclusive VectorStore lock:
 
 1. Choose the applied LSN. No writer can move this boundary during the checkpoint.
 2. Save a same-directory exclusive temporary Flat snapshot, reload/validate it and fsync it.
-3. Publish immutable `checkpoint-LSN.fv` with a no-overwrite hard link and fsync the directory.
+3. Publish immutable `checkpoint-LSN.fv` and `dedup-LSN.fvd` with no-overwrite hard links and fsync the directory.
    A same-LSN retry may reuse an existing file only if its length and checksum match.
 4. Write and fsync a same-directory temporary recovery manifest.
 5. Rename it over `recovery.manifest`, then fsync the directory.
@@ -139,7 +143,7 @@ recovery required: it cannot claim whether the new name is durable. WAL files ar
 even after successful publication. Old checkpoint files are retained; temporary files from
 normal exceptions are removed by RAII, while SIGKILL may leave harmless unreferenced temp files.
 
-The fixed 72-byte `recovery.manifest` contains:
+The legacy version 1, fixed 72-byte `recovery.manifest` contains:
 
 | Offset | Width | Field |
 | --- | --- | --- |
@@ -154,11 +158,10 @@ The fixed 72-byte `recovery.manifest` contains:
 | 56 | 8 | checksum of that WAL prefix, including its header |
 | 64 | 8 | checksum of manifest bytes 0..63 |
 
-The snapshot filename is derived from the checked LSN; no file path is trusted from a manifest.
-Recovery checks manifest bounds, snapshot content and header shape before loading, validates the
-WAL boundary checksum, checks every checkpointed vector against the original log, rebuilds
-retry state, and applies only later records. Missing or inconsistent artifacts reject startup.
-Copy/backup the WAL, manifest and referenced checkpoint together while writes are stopped;
+The filenames are derived from the checked LSN; no file path is trusted from a manifest.
+Legacy recovery validates the WAL prefix; version 2 instead validates the paired checkpoint
+files and reads only the suffix. Missing or inconsistent required artifacts reject startup.
+Copy/backup the WAL, manifest, index and dedup checkpoint together while writes are stopped;
 copying just the snapshot loses persistent retry state.
 
 ## Running
