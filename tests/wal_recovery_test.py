@@ -99,6 +99,12 @@ class WalRecoveryIntegrationTest(unittest.TestCase):
                 self.assertEqual(stats.durability.applied_lsn, 100)
                 self.assertEqual(stats.durability.checkpoint_lsn, 50 if checkpoint else 0)
                 self.assertEqual(stats.durability.recovered_records, 50 if checkpoint else 100)
+                self.assertEqual(stats.durability.dedup_entries,100)
+                self.assertGreater(stats.durability.dedup_metadata_bytes,0)
+                if checkpoint:
+                    self.assertGreater(stats.durability.dedup_file_bytes,0)
+                    self.assertLess(stats.durability.wal_scan_bytes,
+                                    (directory/"operations.wal").stat().st_size-40)
                 after = client.search([1, 2, 3], 100)
                 def exact(response):
                     return [(n.id, struct.pack("<f", n.score)) for n in response.neighbors]
@@ -144,6 +150,35 @@ class WalRecoveryIntegrationTest(unittest.TestCase):
         self.assertFalse(stats.durability.recovery_required)
         self.assertEqual(stats.search_executor.queued_bytes,0)
         self.assertEqual(stats.search_executor.queue_byte_limit,1)
+
+    def test_rotated_service_recovers_acknowledged_writes_and_old_retries(self):
+        directory=self.root/"rotated"
+        directory.mkdir()
+        process,client=self.start(directory,("--wal-rotation","true","--max-wal-bytes","4096"))
+        for i in range(100):
+            self.assertEqual(client.add(1000+i,[i+1,2.3,-3.7],f"op-{i}").lsn,i+1)
+        self.assertEqual(client.checkpoint().lsn,100)
+        stats=client.stats().durability
+        self.assertGreater(stats.wal_generation,1)
+        self.assertGreater(stats.cleaned_files,0)
+        self.assertFalse(stats.cleanup_pending)
+        self.assertEqual(stats.active_wal_bytes,72)
+        self.assertFalse((directory/"operations.wal").exists())
+        self.assertEqual(len(list(directory.iterdir())),5)
+        self.assertEqual(client.add(9999,[1,0,0],"suffix").lsn,101)
+        before=client.search([1,2,3],101)
+        process.kill()
+        self.assertEqual(process.wait(timeout=5),-signal.SIGKILL)
+        client.close()
+        process,client=self.start(directory,("--max-wal-bytes","4096"))
+        after=client.search([1,2,3],101)
+        self.assertEqual([(n.id,n.score) for n in before.neighbors],[(n.id,n.score) for n in after.neighbors])
+        self.assertEqual(client.stats().durability.recovered_records,1)
+        for i in range(100):
+            self.assertTrue(client.add(1000+i,[i+1,2.3,-3.7],f"op-{i}").replayed)
+        self.assertTrue(client.add(9999,[1,0,0],"suffix").replayed)
+        self.assertEqual(client.checkpoint().lsn,101)
+        self.assertGreater(client.stats().durability.wal_generation,stats.wal_generation)
 
     def test_corrupt_complete_record_prevents_server_listening(self):
         directory = self.root / "corrupt"

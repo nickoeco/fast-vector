@@ -32,6 +32,14 @@ message DurabilityStats {
   uint64 last_sync_us = 8;
   uint64 last_write_us = 9;
   uint64 last_checkpoint_us = 10;
+  uint64 dedup_entries = 11;
+  uint64 dedup_metadata_bytes = 12;
+  uint64 dedup_file_bytes = 13;
+  uint64 wal_scan_bytes = 14;
+  uint64 wal_generation = 15;
+  uint64 active_wal_bytes = 16;
+  uint64 cleaned_files = 17;
+  bool cleanup_pending = 18;
 }
 
 message BatchAddRequest {

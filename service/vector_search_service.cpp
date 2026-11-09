@@ -371,6 +371,14 @@ grpc::Status VectorSearchService::GetStats(grpc::ServerContext* context, const v
     durable->set_last_sync_us(durability.last_sync_us);
     durable->set_last_write_us(durability.last_write_us);
     durable->set_last_checkpoint_us(durability.last_checkpoint_us);
+    durable->set_dedup_entries(durability.dedup_entries);
+    durable->set_dedup_metadata_bytes(durability.dedup_metadata_bytes);
+    durable->set_dedup_file_bytes(durability.dedup_file_bytes);
+    durable->set_wal_scan_bytes(durability.wal_scan_bytes);
+    durable->set_wal_generation(durability.wal_generation);
+    durable->set_active_wal_bytes(durability.active_wal_bytes);
+    durable->set_cleaned_files(durability.cleaned_files);
+    durable->set_cleanup_pending(durability.cleanup_pending);
     const auto scheduler = executor_->stats();
     auto* scheduling = response->mutable_search_executor();
     scheduling->set_workers(scheduler.workers);
